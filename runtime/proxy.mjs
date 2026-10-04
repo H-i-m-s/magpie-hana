@@ -31,9 +31,43 @@ const HOP_BY_HOP = new Set([
 
 const DEFAULT_HIDDEN = ["library", "sessions"];
 
+// 上游可能不发 content-type（或我们把它剥了）。宿主会给卡片加 nosniff，
+// 而浏览器对「nosniff + 无正确 MIME」的样式表/脚本是直接拒用的——
+// 表现就是卡片里完全没有 CSS。所以按扩展名兜底补上。
+const MIME = {
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".wasm": "application/wasm",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml",
+  ".html": "text/html; charset=utf-8",
+};
+
+function mimeOf(url) {
+  const path = String(url || "").split("?")[0].toLowerCase();
+  const i = path.lastIndexOf(".");
+  if (i < 0) return null;
+  return MIME[path.slice(i)] || null;
+}
+
 const state = {
   listenPort: 0,
   upstreamPort: 0,
+  recent: [],          // 最近请求（诊断：看卡片实际发的是什么路径）
   upstreamKey: "",
   hidden: new Set(DEFAULT_HIDDEN),
   themeAttr: "",
@@ -66,40 +100,42 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     return out;
   }
 
-  // 优先：直接读宿主已生效的计算值。卡片服务挂在宿主同源下，parent 可达；
-  // 这样不靠主题名猜测，用户换任何主题都自动跟随。跨源时会抛异常，转下一条路。
+  // 只从「祖先窗口」读，不读自己。
+  // 卡片里本页是挂在宿主源下的 iframe，parent 就是 Hana（同源可读）；
+  // 直接访问代理时 parent 就是自己，此时必须跳过——否则会把 magpie 自己的默认色
+  // 当作「宿主主题」再套回去（自我引用）。
   function hostVars(){
-    var w = window, i = 0;
-    while (w && i < 6) {
+    var w = window;
+    try { if (!w.parent || w.parent === w) return null; } catch (e) { return null; }
+    // 从 parent 起逐层向上找第一个同源、能读到变量的窗口
+    for (var k = 0; k < 6; k++) {
+      try {
+        if (!w.parent || w.parent === w) break;
+        w = w.parent;
+      } catch (e) { break; }
       try {
         var d = w.document;
-        if (d && d.documentElement) {
-          var cs = w.getComputedStyle(d.documentElement), out = {};
-          for (var k = 0; k < WANT.length; k++) {
-            var v = cs.getPropertyValue(WANT[k]);
-            if (v && v.trim()) out[WANT[k]] = v.trim();
-          }
-          if (out["--bg"] || out["--text"]) return out;
+        if (!d || !d.documentElement) continue;
+        var comp = w.getComputedStyle(d.documentElement), vars = {};
+        for (var j = 0; j < WANT.length; j++) {
+          var v = comp.getPropertyValue(WANT[j]);
+          if (v && v.trim()) vars[WANT[j]] = v.trim();
         }
-      } catch (e) { /* 跨源，下一个候选 */ }
-      try { if (w === w.parent) break; w = w.parent; } catch (e) { break; }
-      i++;
+        if (vars["--bg"] || vars["--text"]) return vars;
+      } catch (e) { /* 跨源：继续向上，或放弃 */ }
     }
     return null;
   }
 
   function hostThemeName(){
-    var w = window, i = 0;
-    while (w && i < 6) {
+    var w = window;
+    try { if (!w.parent || w.parent === w) return null; } catch (e) { return null; }
+    for (var i = 0; i < 6; i++) {
+      try { if (!w.parent || w.parent === w) break; w = w.parent; } catch (e) { break; }
       try {
-        var d = w.document;
-        if (d && d.documentElement) {
-          var t = d.documentElement.getAttribute("data-theme");
-          if (t && t !== "auto" && t !== "inherit") return t;
-        }
+        var t = w.document && w.document.documentElement && w.document.documentElement.getAttribute("data-theme");
+        if (t && t !== "auto" && t !== "inherit") return t;
       } catch (e) {}
-      try { if (w === w.parent) break; w = w.parent; } catch (e) { break; }
-      i++;
     }
     return null;
   }
@@ -235,12 +271,17 @@ function themeBlock() {
 }
 
 function hiddenBlock() {
+  // 选择器必须对真实的 DOM。magpie 的顶部导航是：
+  //   <nav class="seg" id="nav"><button data-view="library">…</button></nav>
+  // （早先写的 #ptabs [data-ptab=…] 打的是另一个 hidden 的窄屏导航，所以没效果）
   const byFeature = {
-    library: ['#view-library', '#ptabs [data-ptab="library"]'],
-    sessions: ['#view-sessions', '#ptabs [data-ptab="sessions"]'],
-    routing: ['#view-routing', '#ptabs [data-ptab="routing"]'],
-    stats: ['#ptabs [data-ptab="stats"]'],
-    gateway: ['#view-gateway'],
+    library: ['#nav button[data-view="library"]'],
+    sessions: ['#nav button[data-view="sessions"]'],
+    routing: ['#nav button[data-view="routing"]', '#view-routing'],
+    usage: ['#nav button[data-view="usage"]', '#view-usage'],
+    gateway: ['#nav button[data-view="gateway"]', '#view-gateway'],
+    providers: ['#nav button[data-view="providers"]', '#view-providers'],
+    plugins: ['#nav button[data-view="plugins"]', '#view-plugins'],
     "settings-otel": ['#setTab-otel', '#setPage-otel'],
     "settings-sync": ['#setTab-sync', '#setPage-sync'],
     "settings-privacy": ['#setTab-privacy', '#setPage-privacy'],
@@ -337,6 +378,22 @@ function sendHtml(res, text) {
   res.end(buf);
 }
 
+// 宿主把本服务挂在 /api/apps/<id>/routes/_runtime/<rid>[/_surface/<ticket>]/ 下。
+// 浏览器对相对资源（app.css / boot.js）会带上这个前缀；magpie 自己只认根路径，
+// 原样转发它只会回 404。这里把宿主前缀剥掉，还原成服务内路径再转发。
+// 若宿主已经剥过，则正则不匹配，原样返回（no-op），两种情况都对。
+function servicePath(url) {
+  const m = /^\/api\/apps\/[^/]+\/routes\/_runtime\/[^/]+(?:\/_surface\/[^/]+)?(\/.*)?$/.exec(url);
+  return m ? (m[1] || "/") : url;
+}
+
+function note(url, status, ct) {
+  try {
+    state.recent.push({ t: Date.now(), url, path: servicePath(url), status, ct: ct || "" });
+    if (state.recent.length > 40) state.recent.shift();
+  } catch { /* 忽略 */ }
+}
+
 // ── 反代 ─────────────────────────────────────────────────────────────────────
 function proxyRequest(clientReq, clientRes) {
   if (!state.upstreamPort) {
@@ -361,24 +418,35 @@ function proxyRequest(clientReq, clientRes) {
     host: UPSTREAM_HOST,
     port: state.upstreamPort,
     method: clientReq.method,
-    path: clientReq.url,
+    path: servicePath(clientReq.url),
     headers,
   }, (upRes) => {
     const ct = String(upRes.headers["content-type"] || "");
-    const isHtml = /text\/html/i.test(ct);
+    // 上游不给 HTML 页发 content-type 时，靠路径兜底（无扩展名的当页面），
+    // 否则会漏掉注入（主题、隐藏、base 垫片全失效）。
+    const urlPath = String(clientReq.url || "").split("?")[0].toLowerCase();
+    const hasExt = /\.[a-z0-9]{1,8}$/.test(urlPath);
+    const isHtml = /text\/html/i.test(ct) || (ct === "" && (!hasExt || urlPath.endsWith(".html")));
+    note(clientReq.url, upRes.statusCode || 0, ct);
 
+    // 非 HTML 原样透传（连 content-type / content-length / content-encoding 一起），
+    // 只对要注入重算的 HTML 剥掉这三个。
     const outHeaders = {};
     for (const [k, v] of Object.entries(upRes.headers)) {
       const lk = k.toLowerCase();
       if (HOP_BY_HOP.has(lk)) continue;
       // 去掉会妨碍我们注入/内嵌的头
       if (lk === "x-frame-options" || lk === "content-security-policy") continue;
-      if (lk === "content-encoding" || lk === "content-length" || lk === "content-type") continue;
+      if (isHtml && (lk === "content-encoding" || lk === "content-length" || lk === "content-type")) continue;
       outHeaders[lk] = v;
     }
 
     if (!isHtml) {
-      // 非 HTML：原样流式透传
+      // 非 HTML：原样流式透传。但 MIME 必须可靠——见上方 MIME 注释。
+      if (!outHeaders["content-type"]) {
+        const guess = mimeOf(clientReq.url);
+        if (guess) outHeaders["content-type"] = guess;
+      }
       clientRes.writeHead(upRes.statusCode || 502, outHeaders);
       upRes.pipe(clientRes);
       return;
@@ -415,6 +483,7 @@ function proxyRequest(clientReq, clientRes) {
   upReq.on("error", (e) => {
     state.lastError = String(e && e.message ? e.message : e);
     log("上游连接失败：" + state.lastError);
+    note(clientReq.url, 0, "upstream-error");
     try {
       if (!clientRes.headersSent) sendHtml(clientRes, waitingPage("上游连接失败：" + state.lastError));
       else clientRes.end();
@@ -451,6 +520,7 @@ async function handleInternal(req, res) {
       upstreamPort: state.upstreamPort, magpiePid: state.magpiePid,
       error: state.lastError, hidden: [...state.hidden],
       requests: state.requests, rewrites: state.rewrites,
+      recent: state.recent.slice(-30),
       theme: state.themeAttr,
     });
     return true;
