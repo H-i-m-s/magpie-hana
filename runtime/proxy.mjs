@@ -92,12 +92,16 @@ const state = {
   diag: [],              // 诊断：入站原始请求头 + 卡片内部上报的页面上下文
 };
 
-// HANA_HOME/user/preferences.json 里的 appearance.theme。
+// HANA_HOME/user/preferences.json 里的 appearance.theme，以及浅/深调色板。
 // 为什么服务端要读：卡片 iframe 里拿主题名有两条路——读父窗口的 data-theme、
-// 或宿主在 URL 上带 hana-theme 参数。实测本 App 的服务挂载模式下两者都不保证。
-// 所以再配一条完全不依赖网络与父窗口的：进程启动时自己读一次。
-// 代价是用户换了 Hana 主题后，服务端这份要等下一次 reload 才更新
-// （卡片侧的 MutationObserver 会先跟上，两者互为兜底）。
+// 或宿主在 URL 上带 hana-theme 参数；而 auto 模式下的「浅色用哪套 / 深色用哪套」
+// 只有宿主自己知道。进程按需读一次就够（Hana 换主题时会写这个文件）。
+//
+// 注意：Hana 的 auto 模式实际是把 auto 解析成一个具体主题（默认 light→warm-paper、
+// dark→midnight），preferences 里可能存的是 "auto"。这里就按 Hana 的默认规则解析。
+const HANA_AUTO_LIGHT = "warm-paper";
+const HANA_AUTO_DARK = "midnight";
+
 function readHanaTheme() {
   try {
     const dataDir = process.cwd();                    // …\app-data\magpie-hana
@@ -106,10 +110,27 @@ function readHanaTheme() {
     if (!existsSync(f)) return "";
     const j = JSON.parse(readFileSync(f, "utf8"));
     const t = j && j.appearance && typeof j.appearance.theme === "string" ? j.appearance.theme : "";
-    return t && t !== "auto" ? t : "";
+    return t;
   } catch {
     return "";
   }
+}
+
+// 给卡片脚本的「宿主当前主题」：解析掉 auto，并附上浅/深调色板名。
+// 宿主在 URL 上给的是挂载当刻的值；用户随后在 Hana 里换主题时，这个端点
+// 会读到新的 preferences，卡片脚本每 5 秒问一次就能跟上。
+function hostThemeInfo() {
+  const raw = readHanaTheme();
+  // 系统的明暗这里拿不到（代理是独立进程），但 Hana 的 auto 实际按
+  // 「浅色→warm-paper、深色→midnight」解析；卡片侧若能从 magpie 自己的
+  // data-theme 判断出明暗，会用它去挑对应的那套。
+  const theme = raw && raw !== "auto" ? raw : "";
+  return {
+    raw: raw || "",
+    theme: theme || HANA_AUTO_DARK,
+    light: HANA_AUTO_LIGHT,
+    dark: HANA_AUTO_DARK,
+  };
 }
 
 // HANA 的 server-info.json（拿到宿主的 HTTP 端口，用来取主题 CSS）。
@@ -134,16 +155,31 @@ function fetchThemeCss(name) {
   return new Promise((resolve) => {
     const port = readHanaServerPort();
     if (!port) return resolve({ ok: false, error: "读不到 HANA 的 server-info.json" });
-    const themeName = name || readHanaTheme();
-    const q = themeName ? `?theme=${encodeURIComponent(themeName)}` : "";
-    const req = httpRequest(
-      { host: "127.0.0.1", port, path: `/api/apps/theme.css${q}`, method: "GET", timeout: 6000 },
-      (r) => {
-        if (r.statusCode !== 200) { r.resume(); return resolve({ ok: false, error: `宿主返回 ${r.statusCode}` }); }
-        const chunks = [];
-        r.on("data", (c) => chunks.push(c));
-        r.on("end", () => resolve({ ok: true, theme: themeName || "(宿主默认)", css: Buffer.concat(chunks).toString("utf8") }));
-      });
+    // 不带主题名时：绝不能省掉 ?theme= —— 实测宿主对无参请求返回的是
+    // *默认*主题（暖纸 #F8F4ED），不是用户当前主题。这里自己解析。
+    let themeName = String(name || "").trim();
+    if (!themeName) {
+      const raw = readHanaTheme();
+      themeName = raw && raw !== "auto" ? raw : HANA_AUTO_DARK;
+    } else if (themeName === "auto") {
+      themeName = HANA_AUTO_DARK;
+    }
+    const q = `?theme=${encodeURIComponent(themeName)}`;
+    let req;
+    try {
+      req = httpRequest(
+        { host: "127.0.0.1", port, path: `/api/apps/theme.css${q}`, method: "GET", timeout: 6000 },
+        (r) => {
+          if (r.statusCode !== 200) { r.resume(); return resolve({ ok: false, error: `宿主返回 ${r.statusCode}` }); }
+          const chunks = [];
+          r.on("data", (c) => chunks.push(c));
+          r.on("end", () => resolve({ ok: true, theme: themeName, css: Buffer.concat(chunks).toString("utf8") }));
+        });
+    } catch (e) {
+      // httpRequest 可能在同步阶段就抛（端口/参数不合法等）。不接住就是一个
+      // 未处理的 rejection，会把整个代理进程带走。
+      return resolve({ ok: false, error: String((e && e.message) || e) });
+    }
     req.on("timeout", () => { try { req.destroy(); } catch { /* 忽略 */ } resolve({ ok: false, error: "取主题超时" }); });
     req.on("error", (e) => resolve({ ok: false, error: String(e && e.message || e) }));
     req.end();
@@ -152,46 +188,102 @@ function fetchThemeCss(name) {
 
 const log = (m) => process.stderr.write(`[magpie-hana] ${m}\n`);
 
-// ── 主题：在客户端按宿主当前主题取色 ────────────────────────────────────────
-// 为什么不在这里硬编码色号：Hana 的主题是用户可换的命名主题（青夜 / 暖纸 /
-// 高对比 …），色号写死在代理里，一换主题就错。改成注入一段脚本，向宿主
-// /api/apps/theme.css 取「当前主题」的真实变量，再映射到 magpie 的变量名。
-// 用 !important 提升特异性，压过 magpie 自己的 :root / :root[data-theme]。
+// ── 主题：把「Hana 的配色」注入 magpie，但不夺走它自己的开关 ───────────
+//
+// v0.3.x 的做法有两个错：
+//   ① 用 !important 无条件压住 magpie 的全部颜色变量，还往它的 data-theme
+//      属性上写值 —— 于是 magpie 设置页里的「外观（跟随系统/浅色/深色）」
+//      成了摆设，按了没反应（15 秒后又被这里改回去）。
+//   ② 取「宿主当前主题」时用了不带参数的 /api/apps/theme.css，而它返回的是
+//      *默认*主题（暖纸 #F8F4ED），不是用户当前主题（青夜 #3B4A54）。
+//      所以「跟随 Hana」从一开始就没跟对过。
+//
+// 现在的做法：
+//   · 主题名与三套调色板（当前 / 浅色 / 深色）从卡片 iframe 的 URL 参数读。
+//     宿主确实会带：hana-theme、hana-css、hana-palette-light-theme/-css、
+//     hana-palette-dark-theme/-css。这比读 preferences.json 实时，也比读
+//     父窗口计算样式可靠（桌面版未必同源）。
+//   · 不再写 magpie 的 data-theme，改成**读**它：用户在 magpie 里选浅色/深色，
+//     就切到 Hana 对应的浅色/深色主题。开关因此真正可用，配色仍来自 Hana。
+//   · 颜色变量仍带 !important（否则压不过 magpie 自己的 :root[data-theme]），
+//     但这是一层「皮肤」，不再改动 magpie 的任何行为属性。
+//   · 宿主当前版本不会主动推 hana.theme.changed（在 bundle 里搜不到），所以
+//     跟随靠轮询：页面每 5 秒问一次代理「宿主现在是什么主题」。
 const THEME_CLIENT = `<script id="hana-theme-client">
 (function(){
   var STYLE_ID = "hana-theme";
-  // 需要从宿主取的变量（Hana 的主题用这套命名）
-  var WANT = ["--bg","--bg-card","--bg-glass","--sidebar-bg","--accent","--accent-hover",
-              "--text","--text-light","--text-muted","--border","--shadow",
-              "--green","--coral","--danger","--pop-bg"];
 
-  // 只从「祖先窗口」读，不读自己。
-  // 卡片里本页是挂在宿主源下的 iframe，parent 就是 Hana（同源可读）；
-  // 直接访问代理时 parent 就是自己，此时必须跳过——否则会把 magpie 自己的默认色
-  // 当作「宿主主题」再套回去（自我引用）。
-  function hostVars(){
-    var w = window;
-    try { if (!w.parent || w.parent === w) return null; } catch (e) { return null; }
-    // 从 parent 起逐层向上找第一个同源、能读到变量的窗口
-    for (var k = 0; k < 6; k++) {
-      try {
-        if (!w.parent || w.parent === w) break;
-        w = w.parent;
-      } catch (e) { break; }
-      try {
-        var d = w.document;
-        if (!d || !d.documentElement) continue;
-        var comp = w.getComputedStyle(d.documentElement), vars = {};
-        for (var j = 0; j < WANT.length; j++) {
-          var v = comp.getPropertyValue(WANT[j]);
-          if (v && v.trim()) vars[WANT[j]] = v.trim();
-        }
-        if (vars["--bg"] || vars["--text"]) return vars;
-      } catch (e) { /* 跨源：继续向上，或放弃 */ }
-    }
-    return null;
+  // ── 宿主在卡片 iframe 的 URL 上给的参数 ──────────────────────────────
+  var q = new URLSearchParams(location.search || "");
+  var P = {
+    theme: q.get("hana-theme") || "",
+    appearance: q.get("hana-theme-appearance") || "",
+    light: q.get("hana-palette-light-theme") || "",
+    lightCss: q.get("hana-palette-light-css") || "",
+    dark: q.get("hana-palette-dark-theme") || "",
+    darkCss: q.get("hana-palette-dark-css") || "",
+    css: q.get("hana-css") || ""
+  };
+
+  // 卡片挂载前缀（形如 /api/apps/<id>/routes/_runtime/<rid>/_surface/<token>）。
+  // 直接访问代理时 pathname 就是 "/"，此时必须返回空串：
+  // 否则 BASE + "/_hana/x" 会拼成 "//_hana/x"（双斜杠），代理认不出这个前缀。
+  function mountBase(){
+    var p = location.pathname || "/";
+    if (p === "/") return "";
+    return (p.charAt(p.length - 1) === "/") ? p.slice(0, -1) : p;
+  }
+  var BASE = mountBase();
+
+  // ── 变量表 ───────────────────────────────────────────────────────────
+  // seedVars：服务端随页面注入的「首屏变量表」（就是宿主当前的配色）。
+  // 它是**一张变量表**，不是「主题名 -> 变量表」的映射，所以单独放，
+  // 只当首屏兵底用，不往 cache 里塞（早先塞错了，导致按名取时命中一张假表）。
+  // cache：主题名 -> 变量表。按需从宿主 / 代理取，取到就留着。
+  var cache = {};
+  var seedVars = (window.__hanaVars && typeof window.__hanaVars === "object") ? window.__hanaVars : null;
+
+  function parseVars(css){
+    var out = {}, re = /(--[A-Za-z0-9_-]+)\\s*:\\s*([^;}]+)/g, m;
+    while ((m = re.exec(css))) out[m[1]] = m[2].replace(/!important/gi, "").trim();
+    return out;
+  }
+  function usable(v){ return !!(v && (v["--bg"] || v["--text"])); }
+
+  // 某个主题名对应的「宿主给的」完整 CSS URL（同源可直接取，最准）
+  function hostCssUrl(name){
+    if (!name) return "";
+    if (name === P.theme) return P.css;
+    if (name === P.light) return P.lightCss;
+    if (name === P.dark) return P.darkCss;
+    return "";
   }
 
+  // 取变量表：内存 -> 首屏种子（仅当前主题） -> 宿主 URL -> 代理端点
+  function varsFor(name){
+    if (!name) return Promise.resolve(null);
+    if (cache[name]) return Promise.resolve(cache[name]);
+    // 首屏：如果请求的正是宿主当前主题，而服务端也备好了种子，直接用。
+    // （直接访问代理时没有 URL 参数，P.theme 为空，此时也会落到这里。）
+    if (seedVars && usable(seedVars) && (!P.theme || name === P.theme)) {
+      cache[name] = seedVars;
+      return Promise.resolve(seedVars);
+    }
+    var host = hostCssUrl(name);
+    var url = host || (BASE + "/_hana/theme?theme=" + encodeURIComponent(name));
+    return fetch(url, { credentials: "same-origin" })
+      .then(function(r){ return r.ok ? r.text() : ""; })
+      .then(function(text){
+        var v = null;
+        try { var j = JSON.parse(text); v = j && j.vars ? j.vars : null; } catch (e) { v = null; }
+        if (!usable(v)) v = parseVars(text);
+        if (usable(v)) { cache[name] = v; return v; }
+        return null;
+      })
+      .catch(function(){ return null; });
+  }
+
+  // ── 配色构造：把 Hana 的变量名映射到 magpie 的变量名 ────────────────
   function luminance(c){
     if (!c) return null;
     c = String(c).trim();
@@ -215,7 +307,6 @@ const THEME_CLIENT = `<script id="hana-theme-client">
       }
       return "";
     }
-    // 宿主变量名优先，自己那套（--fg / --card）兼容处理
     var bg = g("--bg") || "#1b1e24";
     var card = g("--bg-card", "--card") || "#232830";
     var fg = g("--text", "--fg") || "#e6e9ef";
@@ -228,7 +319,7 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     var border = g("--border");
     var shadowColor = g("--shadow") || "rgba(0,0,0,.4)";
     var s = [];
-    // 自定义属性带 !important：压过 magpie 自己的 :root / :root[data-theme]（实测它没有 !important）
+    // 带 !important：要压过 magpie 自己的 :root / :root[data-theme]（它没带）。
     function set(n, val){ if (val) s.push(n + ":" + val + " !important"); }
     set("--hana-bg", bg); set("--hana-card", card); set("--hana-fg", fg);
     set("--hana-fg-2", fg2); set("--hana-muted", muted);
@@ -277,36 +368,130 @@ const THEME_CLIENT = `<script id="hana-theme-client">
       (document.head || document.documentElement).appendChild(el);
     }
     if (el.textContent !== built.css) el.textContent = built.css;
-    try {
-      if (document.documentElement.getAttribute("data-theme") !== built.scheme)
-        document.documentElement.setAttribute("data-theme", built.scheme);
-    } catch (e) {}
+    // 注意：这里【不碰】 document.documentElement 的 data-theme。
+    // 那是 magpie 自己的「外观」开关（system/light/dark）的地盘，
+    // 抢过来写就等于把它的设置项焊死。我们只读它，见 render() 里的选取逻辑。
   }
 
-  // 主题变量表由服务端备好（它是从宿主取的，且能看真实配置），
-  // 卡片脚本只负责套用。这样两种环境（卡片内 / 直接访问）行为一致。
-  if (window.__hanaVars && typeof window.__hanaVars === "object") applyVars(window.__hanaVars);
 
-  // auto 时优先读宿主已生效的计算值（同一文档树，最准，换主题能当场上跟着变）；
-  // 读不到就用服务端给的那份（直接访问代理、跨源时就是这样）。
-  // 固定主题：服务端给的已经是准的，不折腾。
-  function refresh(){
-    if ((window.__hanaThemeChoice || "auto") !== "auto") return;
-    var v = hostVars();
-    if (v) applyVars(v);
+  var appliedKey = "";
+  // followNow：Hana 那边刚换过主题。为 true 时，这一次渲染无条件跟随
+  // Hana 当前主题（忽略 magpie 自己的 light/dark）。
+  //
+  // 这样 magpie 的「外观」开关成了一次「手动覆盖」：你点它，卡片按
+  // 你的明暗偏好走（映射到 Hana 的对应浅/深主题）；等你下次在 Hana 里
+  // 换主题，跟随重新接管。两个诉求因此不打架。
+  var followNow = true;
+
+  function dataThemeAttr(){
+    try { return document.documentElement.getAttribute("data-theme") || ""; } catch (err) { return ""; }
   }
 
-  refresh();
+  function render(){
+    var choice = window.__hanaThemeChoice || "auto";
+    if (choice !== "auto") {
+      if (appliedKey === choice + "|" + dataThemeAttr()) return Promise.resolve();
+      return varsFor(choice).then(function(v){
+        if (!v) return;
+        applyVars(v);
+        appliedKey = choice + "|" + dataThemeAttr();
+      });
+    }
+    var host = hostName || P.theme || "";
+    if (!host) return Promise.resolve();
+    return varsFor(host).then(function(v){
+      if (!v) return;
+      var dt = dataThemeAttr();
+      var target = host;
+      if (!followNow && (dt === "light" || dt === "dark") && schemeOf(v) && schemeOf(v) !== dt) {
+        target = dt === "light" ? (P.light || "warm-paper") : (P.dark || "midnight");
+      }
+      followNow = false;
+      if (target === host) {
+        if (appliedKey !== host + "|" + dt) { applyVars(v); appliedKey = host + "|" + dt; }
+        return;
+      }
+      if (appliedKey === target + "|" + dt) return;
+      return varsFor(target).then(function(v2){
+        if (!v2) return;
+        applyVars(v2);
+        appliedKey = target + "|" + dt;
+      });
+    });
+  }
+
+  // 判一套配色变量的明暗（用来和 magpie 自己的 data-theme 比对）。
+  // 放在 render 之前定义；早先这次清理误删过它，导致 render 里抛
+  // ReferenceError 被 .catch 吞掉，样式永远注入不进去（现象：--bg 一直是
+  // magpie 默认值，而且日志里什么都不报）。
+  function schemeOf(v){
+    if (!v) return "";
+    var lum = luminance(v["--bg"] || v["--background"] || "");
+    if (lum === null) return "";
+    return lum > 0.55 ? "light" : "dark";
+  }
+
+  // 诊断出口：把内部状态挂到 window 上，便于从外部查「为什么没跟上」。
+  // 只读，不影响任何行为。（早先没有这个，定位轮询问题时只能猜。）
+  window.__hanaThemeDiag = function(){
+    return {
+      choice: window.__hanaThemeChoice || "auto",
+      hostName: hostName,
+      urlTheme: P.theme,
+      light: P.light,
+      dark: P.dark,
+      appliedKey: appliedKey,
+      dataTheme: dataThemeAttr(),
+      cacheKeys: Object.keys(cache),
+      hasSeed: !!(seedVars && usable(seedVars)),
+      dataTheme: document.documentElement.getAttribute("data-theme") || "",
+      styleLen: (document.getElementById(STYLE_ID) || {}).textContent ? document.getElementById(STYLE_ID).textContent.length : 0,
+      base: BASE,
+      href: location.href
+    };
+  };
+
+  render();
+
+  // magpie 自己改 data-theme（用户点它的外观开关）时立刻跟上。
+  // 这里把 appliedKey 清掉再 render：用户显式改了明暗，这是一次「手动覆盖」，
+  // 必须让它当场生效（followNow 在首次渲染后已是 false，所以会走明暗映射）。
   try {
-    var top = window;
-    while (top && top.parent && top.parent !== top) top = top.parent;
-    if (top && top.document && top.document.documentElement && window.MutationObserver) {
-      new MutationObserver(function(){ refresh(); })
-        .observe(top.document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
+    if (window.MutationObserver) {
+      new MutationObserver(function(){ appliedKey = ""; render(); })
+        .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     }
   } catch (e) {}
 
-  // ── 避让宿主卡片右上角悬浮的按钮簇 ───────────────────────────
+  // ── 跟随 Hana 换主题 ─────────────────────────────────────────────────
+  // 宿主当前版本不主动推 hana.theme.changed（bundle 里搜不到），所以轮询。
+  // hostName 是「当前实际跟着的主题」，也是下一次轮询重算的依据。
+  var hostName = "";
+  function pollHostTheme(){
+    return fetch(BASE + "/_hana/host-theme", { credentials: "same-origin" })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(j){
+        if (!j || !j.theme) return;
+        if (j.light) P.light = j.light;
+        if (j.dark) P.dark = j.dark;
+        // 只跟 hostName 比。不能把 P.theme 也当“当前值”：P.theme 是挂载当刻
+        // 的 URL 快照，拿它比会让首次轮询就把 hostName 定死，之后 A→B→A
+        // 这种来回切换永远回不去。
+        if (j.theme === hostName) return;
+        hostName = j.theme;
+        // Hana 那边换了主题：重新把「跟随」拿回来，并强制重算。
+        // （用户在 magpie 里点过外观的话，followNow 已被置 false；
+        //  这里把它改回 true，于是 Hana 的这一次变更能无条件生效。）
+        followNow = true;
+        appliedKey = "";
+        return render();
+      })
+      .catch(function(){});
+  }
+  pollHostTheme();
+  setInterval(pollHostTheme, 5000);
+
+  // ── 避让宿主卡片右上角悬浮的按钮簇 ───────────────────────────────
   // 宿主在卡片右上角悬浮着它的按钮簇（设置/关闭）。magpie 的头部已改成两行，
   // ↻ ⚙ 挪到了第二行；这里再量出那一簇到底往下占了多少，写成 --hana-head-safe，
   // 让第一行（品牌那一行）的高度刚好把它躲开，第二行整行就都在它下面。
@@ -337,7 +522,7 @@ const THEME_CLIENT = `<script id="hana-theme-client">
           var r;
           try { r = el.getBoundingClientRect(); } catch (err) { continue; }
           if (r.width <= 0 || r.height <= 0) continue;
-          if (r.bottom < fTop) continue;                   // 整块在本视口上方：无关
+          if (r.bottom < fTop) continue;
           var below = r.bottom - fTop;
           if (below > deepest) deepest = below;
           var right = vw - r.left;
@@ -358,32 +543,35 @@ const THEME_CLIENT = `<script id="hana-theme-client">
       } catch (err) {}
     }
     run();
-    // 宿主的悬浮层可能比本页面晚一点布局好，补两次复核
     setTimeout(run, 700);
     setTimeout(run, 2200);
   })();
-
-  // auto 且服务端给的是兜底值时，定期复核（宿主换主题时卡里的观察器先跟上）
-  setInterval(refresh, 15000);
 })();
 </script>
 `;
 
-// 主题变量表：从宿主取一次，缓存起来。
-// auto 时主题名可能被用户改，缓存给个短 TTL；固定主题则永远不变。
-let themeCache = { at: 0, choice: null, vars: null };
+// 主题变量表：给页面首屏注入用（客户端脚本拿到后立即上色，不等任何请求）。
+//
+// choice 为具体主题名时就用它；auto 时按宿主当前主题解析（fetchThemeCss 内部
+// 会读 preferences.json；拿不到就回退到 HANA_AUTO_DARK）。
+// TTL 给短一点：用户的 Hana 主题可能随时换，服务端这份要能跟上。
+let themeCache = { at: 0, key: null, vars: null };
 
 async function themeVars() {
   const choice = state.themeChoice || "auto";
-  const ttl = choice === "auto" ? 10_000 : 60 * 60 * 1000;
-  const fresh = themeCache.vars && themeCache.choice === choice && (Date.now() - themeCache.at) < ttl;
+  let key = choice;
+  if (choice === "auto") {
+    const raw = readHanaTheme();
+    key = "auto:" + (raw && raw !== "auto" ? raw : HANA_AUTO_DARK);
+  }
+  const fresh = themeCache.vars && themeCache.key === key && (Date.now() - themeCache.at) < 5000;
   if (fresh) return themeCache.vars;
 
   const r = await fetchThemeCss(choice === "auto" ? "" : choice);
   if (!r.ok) return themeCache.vars || null;   // 取不到就用旧的，不把页面搞硬
   const vars = parseThemeVars(r.css);
   if (!vars || !(vars["--bg"] || vars["--text"])) return themeCache.vars || null;
-  themeCache = { at: Date.now(), choice, vars };
+  themeCache = { at: Date.now(), key, vars };
   state.themeApplied = r.theme || choice;
   return vars;
 }
@@ -775,6 +963,10 @@ function sendJson(res, obj, status = 200) {
   const buf = Buffer.from(JSON.stringify(obj), "utf8");
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": String(buf.length) });
   res.end(buf);
+  // 返回 true：内部端点用 `return sendJson(...)` 表示「已处理」，
+  // 早先它隐式返回 undefined，会被上层当成未处理，再补一个 404，
+  // 结果是「Cannot write headers after they are sent」。
+  return true;
 }
 
 async function handleInternal(req, res) {
@@ -813,11 +1005,18 @@ async function handleInternal(req, res) {
   // 主题选择（auto / 具体主题名）。GET 给注入的客户端脚本读，POST 由设置页改。
   if (path === "/_hana/theme" && req.method === "GET") {
     const want = new URL(req.url || "/", "http://x").searchParams.get("theme");
-    if (want) {
-      // 卡片脚本可以按名要一套；auto 时用宿主的当前主题
-      const r = await fetchThemeCss(want === "auto" ? "" : want);
+    if (want !== null) {
+      // 带 theme（即使是空串/ auto）都当「要变量表」处理。
+      // 空串/auto -> 按宿主当前主题解析（fetchThemeCss 内部会做）。
+      const r = await fetchThemeCss(want);
       if (!r.ok) return sendJson(res, { ok: false, error: r.error || "取主题失败" }, 502);
-      return sendJson(res, { ok: true, theme: r.theme, vars: parseThemeVars(r.css) });
+      const vars = parseThemeVars(r.css);
+      // 宿主对某些名字（例如旧版里的 light/dark）会返回一份不含变量的空壳，
+      // 这时明确报错，别让调用方拿到一个看似成功的空表。
+      if (!vars["--bg"] && !vars["--text"]) {
+        return sendJson(res, { ok: false, error: `主题 ${r.theme} 没有可用变量（是不是不是 Hana 主题？）`, theme: r.theme }, 502);
+      }
+      return sendJson(res, { ok: true, theme: r.theme, vars });
     }
     sendJson(res, { ok: true, theme: state.themeChoice, applied: state.themeApplied, appearance: state.themeAttr });
     return true;
@@ -827,11 +1026,22 @@ async function handleInternal(req, res) {
     const b = await readJson(req);
     if (typeof b.css === "string") state.themeCss = b.css;   // 保留兼容
     if (typeof b.appearance === "string") state.themeAttr = b.appearance;
-    if (typeof b.theme === "string" && b.theme) {
-      state.themeChoice = b.theme;
-      themeCache = { at: 0, choice: null, vars: null };   // 换了主题：缓存作废
+    if (typeof b.theme === "string") {
+      // 允许把 choice 设回 auto（早先 `&& b.theme` 会把 auto 当假值漏掉？不会——
+      // "auto" 是真值。这里只改成不强求非空，以便未来万一要清空。
+      state.themeChoice = b.theme || "auto";
+      themeCache = { at: 0, key: null, vars: null };   // 换了主题：缓存作废
     }
     sendJson(res, { ok: true, theme: state.themeChoice, appearance: state.themeAttr });
+    return true;
+  }
+
+  // 卡片脚本轮询用：宿主当前的配色三件套（当前 / 浅色 / 深色）。
+  // 为什么需要它：宿主（当前版本）不会主动向卡片推 hana.theme.changed，
+  // 而卡片 iframe 的 URL 参数只是挂载当刻的快照。用户随后在 Hana 里换主题，
+  // 只有这个端点能反映出来。
+  if (path === "/_hana/host-theme") {
+    sendJson(res, { ok: true, ...hostThemeInfo() });
     return true;
   }
 
@@ -945,12 +1155,42 @@ function main() {
 
   server = createServer((req, res) => {
     if ((req.url || "").startsWith("/_hana/")) {
+      // 必须自己 .catch：Node 15+ 里未处理的 Promise rejection 默认会让进程
+      // 直接退出。内部端点里只要有一处抛出（比如取主题时的 httpRequest 同步抛），
+      // 整个代理就会死——而外表看上去只是“某个请求断了”，很难定位。
       handleInternal(req, res).then((handled) => {
         if (!handled) sendJson(res, { ok: false, error: "unknown internal endpoint" }, 404);
+      }).catch((e) => {
+        state.lastError = "内部端点异常：" + (e && e.message ? e.message : String(e));
+        log(state.lastError);
+        try {
+          if (!res.headersSent) sendJson(res, { ok: false, error: state.lastError }, 500);
+          else res.end();
+        } catch { /* 忽略 */ }
       });
       return;
     }
-    proxyRequest(req, res);
+    try {
+      proxyRequest(req, res);
+    } catch (e) {
+      state.lastError = "转发异常：" + (e && e.message ? e.message : String(e));
+      log(state.lastError);
+      try {
+        if (!res.headersSent) sendHtml(res, waitingPage(state.lastError));
+        else res.end();
+      } catch { /* 忽略 */ }
+    }
+  });
+
+  // 整个进程的兵底：任何漏网的 rejection / 异常都不要让代理静默死掉。
+  // 宁可留一条日志与 lastError，也别再出现「请求突然 ECONNRESET」这种现场。
+  process.on("unhandledRejection", (e) => {
+    state.lastError = "unhandledRejection：" + (e && e.message ? e.message : String(e));
+    log(state.lastError);
+  });
+  process.on("uncaughtException", (e) => {
+    state.lastError = "uncaughtException：" + (e && e.message ? e.message : String(e));
+    log(state.lastError);
   });
   server.on("error", (e) => {
     state.phase = "error";

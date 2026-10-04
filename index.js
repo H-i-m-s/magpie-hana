@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ID = "magpie-hana";
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.4.0";
 
 const PROXY_ENTRY = "runtime/proxy.mjs";
 const VENDOR_EXE = "vendor/magpie-windows-amd64.exe";
@@ -388,12 +388,13 @@ export default defineApp(async (sdk) => {
   }
 
   // 主题：auto = 跟随 Hana 当前主题；否则用指定的命名主题（青夜/暖纸/…）。
-  // 推给代理后，卡片内注入的脚本会在下一次轮询（最多 15s）或重开卡片时跟上。
+  // 注意：只收 Hana 真正存在的主题名。"light"/"dark" 不是 Hana 主题
+  // （宿主对它们返回空 CSS），它们属于 magpie 自己的外观开关。
   async function actTheme(args) {
     const VALID = new Set([
-      "auto", "light", "dark", "warm-paper", "new-warm-paper", "midnight",
-      "midnight-contrast", "high-contrast", "grass-aroma", "contemplation",
-      "absolutely", "delve", "deep-think", "coral",
+      "auto", "warm-paper", "new-warm-paper", "midnight", "midnight-contrast",
+      "high-contrast", "grass-aroma", "contemplation", "absolutely", "delve",
+      "deep-think", "coral",
     ]);
     if (typeof args.theme === "string" && args.theme) {
       if (!VALID.has(args.theme)) {
@@ -442,7 +443,7 @@ export default defineApp(async (sdk) => {
         "status=托管状态/端口/网关健康状况；models=列出 magpie 当前提供的全部模型（provider/model 形式）；" +
         "quotas=各订阅的额度余量；agents=按来源分组看可用模型；use=（预留，切模型请在 Magpie 工作区操作）；" +
         "start/stop=手动起停托管的 magpie；hidden=查看或设置在工作区里隐藏哪些功能（传 hidden 数组，如 [\"library\",\"sessions\",\"routing\"]）；" +
-        "theme=查看或设置卡片配色（传 theme：\"auto\" 跟随 Hana 当前主题，或指定主题名如 midnight、warm-paper）；" +
+        "theme=查看或设置卡片配色（传 theme：\"auto\" 跟随 Hana 当前主题，或指定 Hana 主题名如 midnight、warm-paper、coral）；" +
         "update-check=查询更新情况（本 App 不自动更新 magpie，更新会中断对话）。",
       parameters: {
         type: "object",
@@ -461,7 +462,7 @@ export default defineApp(async (sdk) => {
           },
           theme: {
             type: "string",
-            description: "theme 动作用：auto（跟随 Hana）或主题名（light/dark/warm-paper/midnight/midnight-contrast/high-contrast/grass-aroma/contemplation/absolutely/delve/deep-think/coral）",
+            description: "theme 动作用：auto（跟随 Hana）或 Hana 主题名（warm-paper/new-warm-paper/midnight/midnight-contrast/high-contrast/grass-aroma/contemplation/absolutely/delve/deep-think/coral）",
           },
         },
       },

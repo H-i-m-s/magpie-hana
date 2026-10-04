@@ -41,7 +41,7 @@
     <div class="row">
       <div class="who">
         <div class="name">主题</div>
-        <div class="desc">自动 = 跟随 Hana 当前主题（你可在 Hana 里换，这里自动跟上）。也可以让 magpie 固定用某一套。</div>
+        <div class="desc">自动 = 跟随 Hana 当前主题，你在 Hana 里换，卡片里 5 秒内跟上。也可以让 magpie 固定用某一套 Hana 主题。<br>magpie 自己设置页里的「外观（跟随系统 / 浅色 / 深色）」仍然可用，会自动对应到 Hana 的浅色/深色主题。</div>
       </div>
       <select id="themeSel"></select>
     </div>
@@ -70,15 +70,15 @@
       { id: 'settings-privacy', label: '设置 · Privacy' },
     ];
 
-    // 与 Hana 内置主题一一对应（参考 git-save-load 的主题选项）
+    // Hana 的全部内置主题（取自 Hana 的 lib/theme.js，共 11 套）。
+    // 注意："浅色"/"深色" 不是 Hana 主题（宿主对这两个名字返回空），
+    // 它们是 magpie 自己的外观选项，由 magpie 设置页管。这里不再列。
     const THEMES = [
-      { id: 'auto', label: '主题 自动（跟随 Hana）' },
-      { id: 'light', label: '浅色' },
-      { id: 'dark', label: '深色' },
-      { id: 'warm-paper', label: '暖纸' },
-      { id: 'new-warm-paper', label: '新暖纸' },
+      { id: 'auto', label: '自动（跟随 Hana）' },
       { id: 'midnight', label: '青夜' },
       { id: 'midnight-contrast', label: '青夜 · 高对比' },
+      { id: 'warm-paper', label: '暖纸' },
+      { id: 'new-warm-paper', label: '新暖纸' },
       { id: 'high-contrast', label: '素白' },
       { id: 'grass-aroma', label: '草香' },
       { id: 'contemplation', label: '沉思' },
