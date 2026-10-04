@@ -67,7 +67,6 @@ export default defineApp(async (sdk) => {
     lastError: null,
     startPromise: null,
     retryIdx: 0,
-    themeCss: "",
     themeAttr: "",
     hidden: readUi().hidden,
     seeding: null,
@@ -158,6 +157,7 @@ export default defineApp(async (sdk) => {
     }
     // 不自己预检能力：授权与否由 runtime.start 报错，那才是权威的。
 
+    await releaseStaleRuntime();
     seedExe();
     mkdirSync(magpieDataDir, { recursive: true });
 
@@ -188,13 +188,16 @@ export default defineApp(async (sdk) => {
       throw new Error(`宿主拒绝启动受管 runtime（${code}）：${raw}`);
     }
     state.runtimeId = rt?.runtimeId || rt?.id || null;
+    // 端口是我们自己选的，当场就能确定——不用等状态查询回报。
+    // （早期版本这里有死锁：查询要先有端口、端口要等查询，白等满 90s）
+    state.proxyPort = port;
 
     // 等代理就绪 + 上游 magpie 就绪
     const deadline = Date.now() + READY_MAX_MS;
+    let lastProbeErr = null;
     while (Date.now() < deadline) {
       try {
         const st = await proxyJson("/_hana/status");
-        state.proxyPort = st.port || state.proxyPort;
         state.upstreamPort = st.upstreamPort || 0;
         state.magpiePid = st.magpiePid || null;
         if (st.phase === "ready" && state.upstreamPort) {
@@ -203,19 +206,23 @@ export default defineApp(async (sdk) => {
           state.retryIdx = 0;
           saveRuntime();
           log(`就绪：代理 ${state.proxyPort} -> magpie ${state.upstreamPort}`);
-          pushThemeNow();
           return;
         }
         if (st.phase === "error") {
           throw new Error(st.error || "magpie 启动失败");
         }
+        lastProbeErr = null;
       } catch (e) {
-        if (/上游|magpie/.test(msgOf(e))) throw e;
-        // 代理还没起来，继续等
+        const m = msgOf(e);
+        // 上游自己的错误（magpie 崩了）就直接放弃，不要空等
+        if (/magpie 启动失败|magpie 退出|spawn 失败|可执行文件不存在/.test(m)) throw e;
+        lastProbeErr = m;  // 代理还没起来，继续等
       }
       await sleep(READY_POLL_MS);
     }
-    throw new Error(`${READY_MAX_MS / 1000}s 内未就绪`);
+    throw new Error(
+      `${READY_MAX_MS / 1000}s 内未就绪` +
+      (lastProbeErr ? `（最后一次探测：${lastProbeErr}）` : ""));
   }
 
   function saveRuntime() {
@@ -254,7 +261,9 @@ export default defineApp(async (sdk) => {
   }
 
   async function stopRuntime() {
-    try { if (state.proxyPort) await proxyJson("/_hana/quit", { method: "POST", body: "{}" }); } catch { /* 忽略 */ }
+    // 先让代理自己优雅退出（它会带走 magpie），再通知宿主回收进程树
+    try { if (state.proxyPort) await proxyJson("/_hana/quit", { method: "POST", body: "{}" }); } catch { /* 代理可能已不在 */ }
+    await sleep(400);
     try {
       if (state.runtimeId && sdk.runtime?.stop) await sdk.runtime.stop(state.runtimeId);
     } catch (e) { warn(`停止 runtime 失败：${msgOf(e)}`); }
@@ -262,74 +271,31 @@ export default defineApp(async (sdk) => {
     state.magpiePid = null; state.phase = "idle";
   }
 
+  // 重载时宿主会卸载旧实例；但收尾是异步的，新一次 start 可能撞上还没释放的
+  // 服务名（"already has an active managed service"）。这里先主动清一次。
+  async function releaseStaleRuntime() {
+    if (!state.runtimeId) return;
+    const old = state.runtimeId;
+    state.runtimeId = null; state.proxyPort = 0; state.upstreamPort = 0; state.magpiePid = null;
+    try { if (sdk.runtime?.stop) await sdk.runtime.stop(old); } catch { /* 已被宿主回收 */ }
+  }
+
   // ── 主题 ──────────────────────────────────────────────────────────────────
-  // magpie 的 app.css 用 :root 上的 CSS 变量。把 Hana 主题映射到它的核心变量。
-  // 宿主签发的是 cssUrl + theme + appearance；这里以 Hana 自己的调色为源做映射。
-  function buildThemeCss(snap) {
-    const dark = (snap?.appearance || snap?.theme || "").toString().toLowerCase().includes("dark")
-      || /midnight|night|dark/i.test(String(snap?.theme || ""));
-    // Hana 的观感：深色蓝调的克制配色（与 SSS 的偏好一致）
-    const p = dark ? {
-      bg: "#16171b", card: "#1e1f24", card2: "#1a1b20", pill: "#26272e", pillHover: "#2e3038",
-      line: "rgba(255,255,255,.07)", line2: "rgba(255,255,255,.05)",
-      fg: "#e8e9ed", fg2: "#c2c4cc", muted: "#8b8d98", faint: "#6a6c76",
-      accent: "#6b7dff", accentSoft: "rgba(107,125,255,.14)", sel: "rgba(107,125,255,.16)",
-      green: "#3ecf8e", greenSoft: "rgba(62,207,142,.14)",
-      red: "#ff6b6b", redSoft: "rgba(255,107,107,.14)",
-      amber: "#e0a458", amberSoft: "rgba(224,164,88,.14)",
-      shadow: "0 16px 44px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.32), 0 0 0 .5px rgba(255,255,255,.06)",
-    } : {
-      bg: "#f4f5f8", card: "#ffffff", card2: "#f9fafc", pill: "#eef0f5", pillHover: "#e6e9f0",
-      line: "rgba(0,0,0,.08)", line2: "rgba(0,0,0,.05)",
-      fg: "#1b1d24", fg2: "#4a4d57", muted: "#82858f", faint: "#a9acb6",
-      accent: "#5b6bdd", accentSoft: "rgba(91,107,221,.1)", sel: "rgba(91,107,221,.12)",
-      green: "#189a58", greenSoft: "rgba(24,154,88,.1)",
-      red: "#d64545", redSoft: "rgba(214,69,69,.1)",
-      amber: "#b45309", amberSoft: "rgba(180,83,9,.1)",
-      shadow: "0 16px 44px rgba(20,22,30,.14), 0 2px 8px rgba(20,22,30,.06), 0 0 0 .5px rgba(20,22,30,.08)",
-    };
-    return `/* magpie-hana: 由 Hana 主题映射 */\n:root {\n` +
-      `  --bg:${p.bg}; --card:${p.card}; --card-2:${p.card2};\n` +
-      `  --pill:${p.pill}; --pill-hover:${p.pillHover};\n` +
-      `  --line:${p.line}; --line-2:${p.line2};\n` +
-      `  --fg:${p.fg}; --fg-2:${p.fg2}; --muted:${p.muted}; --faint:${p.faint};\n` +
-      `  --accent:${p.accent}; --accent-soft:${p.accentSoft}; --sel:${p.sel};\n` +
-      `  --green:${p.green}; --green-soft:${p.greenSoft};\n` +
-      `  --red:${p.red}; --red-soft:${p.redSoft};\n` +
-      `  --amber:${p.amber}; --amber-soft:${p.amberSoft};\n` +
-      `  --shadow:${p.shadow};\n` +
-      `}\n` +
-      `:root[data-theme="dark"] {\n` +
-      `  --bg:${p.bg}; --card:${p.card}; --card-2:${p.card2};\n` +
-      `  --pill:${p.pill}; --pill-hover:${p.pillHover};\n` +
-      `  --line:${p.line}; --line-2:${p.line2};\n` +
-      `  --fg:${p.fg}; --fg-2:${p.fg2}; --muted:${p.muted}; --faint:${p.faint};\n` +
-      `  --accent:${p.accent}; --accent-soft:${p.accentSoft}; --sel:${p.sel};\n` +
-      `  --green:${p.green}; --green-soft:${p.greenSoft};\n` +
-      `  --red:${p.red}; --red-soft:${p.redSoft};\n` +
-      `  --amber:${p.amber}; --amber-soft:${p.amberSoft};\n` +
-      `  --shadow:${p.shadow};\n` +
-      `}\n`;
-  }
-
-  function pushThemeNow() {
-    if (!state.proxyPort || !state.themeCss) return;
-    fire(proxyJson("/_hana/theme", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ css: state.themeCss, appearance: state.themeAttr }),
-    }).catch((e) => warn(`推送主题失败：${msgOf(e)}`)));
-  }
-
+  // 主题不再由服务端推色号（那样会把用户换过的主题写死）。改由 proxy.mjs 注入
+  // 的客户端脚本向宿主 /api/apps/theme.css 取当前主题的真实变量再映射。
+  // 这里只留一个“外观”开关：托盘/系统偏好是亮还是暗，供代理的等待页兜底。
   function applyThemeSnapshot(snap) {
     try {
       state.themeAttr = String(snap?.appearance || "").includes("light") ? "light" : "dark";
-      state.themeCss = buildThemeCss(snap);
-      pushThemeNow();
-    } catch (e) { warn(`主题映射失败：${msgOf(e)}`); }
+      fire(proxyJson("/_hana/theme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appearance: state.themeAttr }),
+      }).catch(() => {}));
+    } catch { /* 忽略 */ }
   }
 
-  // 订阅宿主主题（浏览器 SDK 侧也有，这里是服务端尽力而为）
+  // 订阅宿主主题快照（浏览器 SDK 侧也会自己刷新，这里只是尽早拿到 appearance）
   try {
     if (sdk.bus && typeof sdk.bus.subscribe === "function") {
       fire(sdk.bus.subscribe((ev) => {
@@ -522,7 +488,7 @@ export default defineApp(async (sdk) => {
       });
 
       app.get("/magpie-hana/theme", (c) => c.json({
-        ok: true, appearance: state.themeAttr, hasCss: !!state.themeCss,
+        ok: true, appearance: state.themeAttr,
       }));
 
       app.get("/magpie-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION } }));
@@ -536,7 +502,6 @@ export default defineApp(async (sdk) => {
   // 不阻塞 apply：先返回，让 App 尽快 ready；启动在后台推进。
   fire((async () => {
     try {
-      applyThemeSnapshot({ appearance: "dark", theme: "midnight" });
       await ensureStarted();
       log("magpie 托管就绪");
     } catch (e) {

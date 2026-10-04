@@ -36,7 +36,6 @@ const state = {
   upstreamPort: 0,
   upstreamKey: "",
   hidden: new Set(DEFAULT_HIDDEN),
-  themeCss: "",
   themeAttr: "",
   lastError: null,
   phase: "starting",   // starting | waiting-magpie | ready | error | stopping
@@ -47,10 +46,192 @@ const state = {
 
 const log = (m) => process.stderr.write(`[magpie-hana] ${m}\n`);
 
-// ── 服务端注入（主题 + 隐藏）─────────────────────────────────────────────────
+// ── 主题：在客户端按宿主当前主题取色 ────────────────────────────────────────
+// 为什么不在这里硬编码色号：Hana 的主题是用户可换的命名主题（青夜 / 暖纸 /
+// 高对比 …），色号写死在代理里，一换主题就错。改成注入一段脚本，向宿主
+// /api/apps/theme.css 取「当前主题」的真实变量，再映射到 magpie 的变量名。
+// 用 !important 提升特异性，压过 magpie 自己的 :root / :root[data-theme]。
+const THEME_CLIENT = `<script id="hana-theme-client">
+(function(){
+  var THEME_URL = "/api/apps/theme.css";
+  var STYLE_ID = "hana-theme";
+  // 需要从宿主取的变量（Hana 的主题用这套命名）
+  var WANT = ["--bg","--bg-card","--bg-glass","--sidebar-bg","--accent","--accent-hover",
+              "--text","--text-light","--text-muted","--border","--shadow",
+              "--green","--coral","--danger","--pop-bg"];
+
+  function parseVars(text){
+    var out = {}, re = /(--[A-Za-z0-9_-]+)\\s*:\\s*([^;}]+)/g, m;
+    while ((m = re.exec(text))) { out[m[1]] = m[2].trim(); }
+    return out;
+  }
+
+  // 优先：直接读宿主已生效的计算值。卡片服务挂在宿主同源下，parent 可达；
+  // 这样不靠主题名猜测，用户换任何主题都自动跟随。跨源时会抛异常，转下一条路。
+  function hostVars(){
+    var w = window, i = 0;
+    while (w && i < 6) {
+      try {
+        var d = w.document;
+        if (d && d.documentElement) {
+          var cs = w.getComputedStyle(d.documentElement), out = {};
+          for (var k = 0; k < WANT.length; k++) {
+            var v = cs.getPropertyValue(WANT[k]);
+            if (v && v.trim()) out[WANT[k]] = v.trim();
+          }
+          if (out["--bg"] || out["--text"]) return out;
+        }
+      } catch (e) { /* 跨源，下一个候选 */ }
+      try { if (w === w.parent) break; w = w.parent; } catch (e) { break; }
+      i++;
+    }
+    return null;
+  }
+
+  function hostThemeName(){
+    var w = window, i = 0;
+    while (w && i < 6) {
+      try {
+        var d = w.document;
+        if (d && d.documentElement) {
+          var t = d.documentElement.getAttribute("data-theme");
+          if (t && t !== "auto" && t !== "inherit") return t;
+        }
+      } catch (e) {}
+      try { if (w === w.parent) break; w = w.parent; } catch (e) { break; }
+      i++;
+    }
+    return null;
+  }
+
+  function luminance(c){
+    if (!c) return null;
+    c = String(c).trim();
+    var r, g, b, m;
+    if ((m = /^#([0-9a-f]{3})$/i.exec(c))) {
+      var h = m[1];
+      r = parseInt(h[0]+h[0],16); g = parseInt(h[1]+h[1],16); b = parseInt(h[2]+h[2],16);
+    } else if ((m = /^#([0-9a-f]{6})/i.exec(c))) {
+      r = parseInt(m[1].slice(0,2),16); g = parseInt(m[1].slice(2,4),16); b = parseInt(m[1].slice(4,6),16);
+    } else if ((m = /^rgba?\\(\\s*([\\d.]+)[,\\s]+([\\d.]+)[,\\s]+([\\d.]+)/i.exec(c))) {
+      r = +m[1]; g = +m[2]; b = +m[3];
+    } else { return null; }
+    return (0.2126*r + 0.7152*g + 0.0722*b) / 255;
+  }
+
+  function buildCss(v){
+    function g(){
+      for (var i = 0; i < arguments.length; i++) {
+        var x = v[arguments[i]];
+        if (x && x.indexOf("url(") !== 0) return x;
+      }
+      return "";
+    }
+    // 宿主变量名优先，自己那套（--fg / --card）兼容处理
+    var bg = g("--bg") || "#1b1e24";
+    var card = g("--bg-card", "--card") || "#232830";
+    var fg = g("--text", "--fg") || "#e6e9ef";
+    var fg2 = g("--text-light", "--fg-2") || fg;
+    var muted = g("--text-muted", "--muted") || fg2;
+    var accent = g("--accent") || "#a5b4fc";
+    var green = g("--green") || "#6fd99b";
+    var danger = g("--danger") || "#f28b82";
+    var coral = g("--coral") || danger;
+    var border = g("--border");
+    var shadowColor = g("--shadow") || "rgba(0,0,0,.4)";
+    var s = [];
+    // 自定义属性带 !important：压过 magpie 自己的 :root / :root[data-theme]（实测它没有 !important）
+    function set(n, val){ if (val) s.push(n + ":" + val + " !important"); }
+    set("--hana-bg", bg); set("--hana-card", card); set("--hana-fg", fg);
+    set("--hana-fg-2", fg2); set("--hana-muted", muted);
+    set("--hana-accent", accent); set("--hana-green", green);
+    set("--hana-danger", danger); set("--hana-coral", coral);
+    set("--bg", "var(--hana-bg)");
+    set("--card", "var(--hana-card)");
+    set("--card-2", "color-mix(in srgb, var(--hana-fg) 4%, var(--hana-card))");
+    set("--pill", "color-mix(in srgb, var(--hana-fg) 7%, var(--hana-card))");
+    set("--pill-hover", "color-mix(in srgb, var(--hana-fg) 12%, var(--hana-card))");
+    set("--line", border || "color-mix(in srgb, var(--hana-fg) 15%, transparent)");
+    set("--line-2", "color-mix(in srgb, var(--hana-fg) 8%, transparent)");
+    set("--fg", "var(--hana-fg)");
+    set("--fg-2", "var(--hana-fg-2)");
+    set("--muted", "var(--hana-muted)");
+    set("--faint", "color-mix(in srgb, var(--hana-muted) 62%, transparent)");
+    set("--accent", "var(--hana-accent)");
+    set("--accent-soft", "color-mix(in srgb, var(--hana-accent) 15%, transparent)");
+    set("--accent-fg", "var(--hana-bg)");
+    set("--sel", "color-mix(in srgb, var(--hana-accent) 24%, transparent)");
+    set("--green", "var(--hana-green)");
+    set("--green-soft", "color-mix(in srgb, var(--hana-green) 16%, transparent)");
+    set("--red", "var(--hana-danger)");
+    set("--red-soft", "color-mix(in srgb, var(--hana-danger) 16%, transparent)");
+    set("--amber", "var(--hana-coral)");
+    set("--amber-soft", "color-mix(in srgb, var(--hana-coral) 16%, transparent)");
+    set("--drift", "var(--hana-danger)");
+    set("--drift-soft", "color-mix(in srgb, var(--hana-danger) 16%, transparent)");
+    set("--pop-bg", "color-mix(in srgb, var(--hana-fg) 8%, var(--hana-card))");
+    set("--seg-track", "color-mix(in srgb, var(--hana-fg) 8%, transparent)");
+    set("--seg-thumb", "color-mix(in srgb, var(--hana-fg) 18%, transparent)");
+    set("--ctl-fg", "var(--hana-fg-2)");
+    set("--shadow", "0 16px 44px " + shadowColor + ", 0 2px 8px " + shadowColor);
+    var lum = luminance(bg);
+    var scheme = (lum !== null && lum > 0.55) ? "light" : "dark";
+    return { css: "html:root{color-scheme:" + scheme + "}html:root{" + s.join(";") + "}", scheme: scheme };
+  }
+
+  function applyVars(v){
+    if (!v) return;
+    var built = buildCss(v);
+    var el = document.getElementById(STYLE_ID);
+    if (!el) {
+      el = document.createElement("style");
+      el.id = STYLE_ID;
+      (document.head || document.documentElement).appendChild(el);
+    }
+    if (el.textContent !== built.css) el.textContent = built.css;
+    try {
+      if (document.documentElement.getAttribute("data-theme") !== built.scheme)
+        document.documentElement.setAttribute("data-theme", built.scheme);
+    } catch (e) {}
+  }
+
+  var lastUrl = null;
+  function fetchByUrl(name){
+    var url = THEME_URL + (name ? "?theme=" + encodeURIComponent(name) : "");
+    if (url === lastUrl) return;
+    lastUrl = url;
+    var f = window.__hanaOrigFetch || window.fetch;
+    f.call(window, url, { credentials: "same-origin" })
+      .then(function(r){ return (r && r.ok) ? r.text() : ""; })
+      .then(function(t){ if (t) applyVars(parseVars(t)); })
+      .catch(function(){});
+  }
+
+  // 双层：先读宿主计算值（同一文档树，最准）；读不到再按主题名取 CSS
+  function refresh(){
+    var v = hostVars();
+    if (v) { applyVars(v); lastUrl = null; return; }
+    fetchByUrl(hostThemeName());
+  }
+
+  refresh();
+  try {
+    var top = window;
+    while (top && top.parent && top.parent !== top) top = top.parent;
+    if (top && top.document && top.document.documentElement && window.MutationObserver) {
+      new MutationObserver(function(){ refresh(); })
+        .observe(top.document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
+    }
+  } catch (e) {}
+  setInterval(refresh, 15000);
+})();
+</script>
+`;
+
+// 兜底：宿主侧推来的 css（现在不再由 index.js 推送，保留端点以防将来需要）
 function themeBlock() {
   if (!state.themeCss) return "";
-  return `<style id="hana-theme">\n${state.themeCss}\n</style>\n`;
+  return `<style id="hana-theme-pushed">\n${state.themeCss}\n</style>\n`;
 }
 
 function hiddenBlock() {
@@ -77,6 +258,10 @@ function hiddenBlock() {
 const BASE_SHIM = `<script id="hana-base">
 (function(){
   var p = location.pathname;
+  // 未经改写的原语：本页脚本要访问宿主自己的资源（/api/apps/theme.css）时用它，
+  // 免得被下面这层前缀垫片二次拼接。
+  window.__hanaOrigFetch = window.fetch;
+  window.__hanaXhrOpen = window.XMLHttpRequest && XMLHttpRequest.prototype.open;
   var base = (p.length > 1 && p.charAt(p.length - 1) === '/') ? p.slice(0, -1) : p;
   if (!base || base === '/') return;
   function fix(u){
@@ -115,28 +300,21 @@ const BASE_SHIM = `<script id="hana-base">
 `;
 
 function inject(html) {
-  const block = BASE_SHIM + themeBlock() + hiddenBlock();
-  if (!block) return html;
   let out = html;
-  if (state.themeAttr) {
-    out = out.replace(/<html([^>]*)>/i, (m, attrs) =>
-      /\bdata-theme=/.test(attrs) ? m : `<html${attrs} data-theme="${state.themeAttr}">`);
-  }
-  if (/<head>/i.test(out)) {
-    // 必须排在 magpie 自己的 script 之前
-    out = out.replace(/<head>/i, "<head>" + block);
-    state.rewrites += 1;
-  } else if (/<\/head>/i.test(out)) {
-    out = out.replace(/<\/head>/i, block + "</head>");
-    state.rewrites += 1;
-  }
+  // ① 垫片必须在 magpie 自己的脚本之前
+  if (/<head>/i.test(out)) out = out.replace(/<head>/i, "<head>" + BASE_SHIM);
+  else if (/<html([^>]*)>/i.test(out)) out = out.replace(/<html([^>]*)>/i, (m) => m + BASE_SHIM);
+  // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
+  const tail = themeBlock() + hiddenBlock() + THEME_CLIENT;
+  if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
+  else out += tail;
+  state.rewrites += 1;
   return out;
 }
 
 function waitingPage(reason) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8">
-${state.themeAttr ? `<script>document.documentElement.dataset.theme="${state.themeAttr}"</script>` : ""}
-${themeBlock()}
+${THEME_CLIENT}
 <style>
   body{margin:0;height:100vh;display:flex;align-items:center;justify-content:center;
        background:var(--bg,#16171b);color:var(--fg,#e8e9ed);
@@ -273,16 +451,16 @@ async function handleInternal(req, res) {
       upstreamPort: state.upstreamPort, magpiePid: state.magpiePid,
       error: state.lastError, hidden: [...state.hidden],
       requests: state.requests, rewrites: state.rewrites,
-      theme: state.themeAttr, hasThemeCss: !!state.themeCss,
+      theme: state.themeAttr,
     });
     return true;
   }
 
   if (path === "/_hana/theme" && req.method === "POST") {
     const b = await readJson(req);
-    if (typeof b.css === "string") state.themeCss = b.css;
+    if (typeof b.css === "string") state.themeCss = b.css;   // 保留兼容
     if (typeof b.appearance === "string") state.themeAttr = b.appearance;
-    sendJson(res, { ok: true, theme: state.themeAttr, hasThemeCss: !!state.themeCss });
+    sendJson(res, { ok: true, theme: state.themeAttr });
     return true;
   }
 
