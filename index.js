@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ID = "magpie-hana";
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.3.0";
 
 const PROXY_ENTRY = "runtime/proxy.mjs";
 const VENDOR_EXE = "vendor/magpie-windows-amd64.exe";
@@ -68,23 +68,32 @@ export default defineApp(async (sdk) => {
     startPromise: null,
     retryIdx: 0,
     themeAttr: "",
-    hidden: readUi().hidden,
+    themeChoice: "auto",     // 主题：auto（跟随 Hana）| 具体主题名
+    hidden: ["library", "sessions"],
     seeding: null,
   };
+  {
+    const ui = readUi();
+    state.hidden = ui.hidden;
+    state.themeChoice = ui.theme;
+  }
 
   function readUi() {
     try {
       if (existsSync(uiFile)) {
         const j = JSON.parse(readFileSync(uiFile, "utf8"));
-        return { hidden: Array.isArray(j.hidden) ? j.hidden : ["library", "sessions"] };
+        return {
+          hidden: Array.isArray(j.hidden) ? j.hidden : ["library", "sessions"],
+          theme: typeof j.theme === "string" && j.theme ? j.theme : "auto",
+        };
       }
     } catch { /* 忽略 */ }
-    return { hidden: ["library", "sessions"] };
+    return { hidden: ["library", "sessions"], theme: "auto" };
   }
 
   function saveUi() {
     try {
-      writeFileSync(uiFile, JSON.stringify({ hidden: state.hidden }, null, 2), "utf8");
+      writeFileSync(uiFile, JSON.stringify({ hidden: state.hidden, theme: state.themeChoice }, null, 2), "utf8");
     } catch (e) { warn(`保存 ui.json 失败：${msgOf(e)}`); }
   }
 
@@ -179,6 +188,7 @@ export default defineApp(async (sdk) => {
           `--port=${port}`,
           `--marker=${readyMarker}`,
           `--hidden=${state.hidden.join(",")}`,
+          `--theme=${state.themeChoice || "auto"}`,
         ],
         service: { id: SERVICE_ID, port, readyMarker },
       });
@@ -376,6 +386,34 @@ export default defineApp(async (sdk) => {
     return { text: `当前隐藏：${state.hidden.join(", ") || "（无）"}`, data: { hidden: state.hidden } };
   }
 
+  // 主题：auto = 跟随 Hana 当前主题；否则用指定的命名主题（青夜/暖纸/…）。
+  // 推给代理后，卡片内注入的脚本会在下一次轮询（最多 15s）或重开卡片时跟上。
+  async function actTheme(args) {
+    const VALID = new Set([
+      "auto", "light", "dark", "warm-paper", "new-warm-paper", "midnight",
+      "midnight-contrast", "high-contrast", "grass-aroma", "contemplation",
+      "absolutely", "delve", "deep-think", "coral",
+    ]);
+    if (typeof args.theme === "string" && args.theme) {
+      if (!VALID.has(args.theme)) {
+        throw new Error(`未知主题：${args.theme}（可选：${[...VALID].join(", ")}）`);
+      }
+      state.themeChoice = args.theme;
+      saveUi();
+      if (state.proxyPort) {
+        try {
+          await proxyJson("/_hana/theme", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ theme: state.themeChoice }),
+          });
+        } catch (e) { warn(`推送主题失败：${msgOf(e)}`); }
+      }
+    }
+    const label = state.themeChoice === "auto" ? "自动（跟随 Hana）" : state.themeChoice;
+    return { text: `主题：${label}`, data: { theme: state.themeChoice } };
+  }
+
   async function actStart() {
     await ensureStarted();
     return actStatus();
@@ -403,6 +441,7 @@ export default defineApp(async (sdk) => {
         "status=托管状态/端口/网关健康状况；models=列出 magpie 当前提供的全部模型（provider/model 形式）；" +
         "quotas=各订阅的额度余量；agents=按来源分组看可用模型；use=（预留，切模型请在 Magpie 工作区操作）；" +
         "start/stop=手动起停托管的 magpie；hidden=查看或设置在工作区里隐藏哪些功能（传 hidden 数组，如 [\"library\",\"sessions\",\"routing\"]）；" +
+        "theme=查看或设置卡片配色（传 theme：\"auto\" 跟随 Hana 当前主题，或指定主题名如 midnight、warm-paper）；" +
         "update-check=查询更新情况（本 App 不自动更新 magpie，更新会中断对话）。",
       parameters: {
         type: "object",
@@ -412,12 +451,16 @@ export default defineApp(async (sdk) => {
           action: {
             type: "string",
             enum: ACTIONS,
-            description: "动作：status / models / quotas / agents / use / start / stop / hidden / update-check",
+            description: "动作：status / models / quotas / agents / use / start / stop / hidden / theme / update-check",
           },
           hidden: {
             type: "array",
             items: { type: "string" },
             description: "hidden 动作用：要隐藏的功能 id 数组（library、sessions、routing、stats、gateway、settings-otel、settings-sync、settings-privacy）",
+          },
+          theme: {
+            type: "string",
+            description: "theme 动作用：auto（跟随 Hana）或主题名（light/dark/warm-paper/midnight/midnight-contrast/high-contrast/grass-aroma/contemplation/absolutely/delve/deep-think/coral）",
           },
         },
       },
@@ -464,7 +507,7 @@ export default defineApp(async (sdk) => {
             ok: true, app: { id: APP_ID, version: APP_VERSION },
             phase: state.phase, proxyPort: state.proxyPort, upstreamPort: state.upstreamPort,
             magpiePid: state.magpiePid, magpieVersion: state.magpieVersion,
-            lastError: state.lastError, hidden: state.hidden,
+            lastError: state.lastError, hidden: state.hidden, theme: state.themeChoice,
             gateway: up ? { ok: true, version: up.version, models: up.models } : { ok: false },
           });
         } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
@@ -487,8 +530,15 @@ export default defineApp(async (sdk) => {
         } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
       });
 
+      app.post("/magpie-hana/theme", async (c) => {
+        try {
+          const body = await c.req.json().catch(() => ({}));
+          return c.json(await actTheme({ theme: body.theme }));
+        } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
+      });
+
       app.get("/magpie-hana/theme", (c) => c.json({
-        ok: true, appearance: state.themeAttr,
+        ok: true, theme: state.themeChoice, appearance: state.themeAttr,
       }));
 
       app.get("/magpie-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION } }));

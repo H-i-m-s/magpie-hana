@@ -40,6 +40,17 @@
   <div class="card">
     <div class="row">
       <div class="who">
+        <div class="name">主题</div>
+        <div class="desc">自动 = 跟随 Hana 当前主题（你可在 Hana 里换，这里自动跟上）。也可以让 magpie 固定用某一套。</div>
+      </div>
+      <select id="themeSel"></select>
+    </div>
+    <div id="themeNote" class="kv"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="who">
         <div class="name">工作区里隐藏的功能</div>
         <div class="desc">只隐藏入口，不解除底层能力。改动立即生效，重新打开工作区即可看到。</div>
       </div>
@@ -57,6 +68,24 @@
       { id: 'settings-otel', label: '设置 · Observability' },
       { id: 'settings-sync', label: '设置 · Sync and backup' },
       { id: 'settings-privacy', label: '设置 · Privacy' },
+    ];
+
+    // 与 Hana 内置主题一一对应（参考 git-save-load 的主题选项）
+    const THEMES = [
+      { id: 'auto', label: '主题 自动（跟随 Hana）' },
+      { id: 'light', label: '浅色' },
+      { id: 'dark', label: '深色' },
+      { id: 'warm-paper', label: '暖纸' },
+      { id: 'new-warm-paper', label: '新暖纸' },
+      { id: 'midnight', label: '青夜' },
+      { id: 'midnight-contrast', label: '青夜 · 高对比' },
+      { id: 'high-contrast', label: '素白' },
+      { id: 'grass-aroma', label: '草香' },
+      { id: 'contemplation', label: '沉思' },
+      { id: 'absolutely', label: 'Absolutely' },
+      { id: 'delve', label: 'Delve' },
+      { id: 'deep-think', label: 'Deep Think' },
+      { id: 'coral', label: '珊瑚' },
     ];
     let hidden = [];
 
@@ -110,11 +139,36 @@
         ].join(' · ');
         if (st.lastError) document.getElementById('status').textContent = '最近错误：' + st.lastError;
         else document.getElementById('status').textContent = '';
+        const sel = document.getElementById('themeSel');
+        if (sel && st.theme) sel.value = st.theme;
       } catch (e) {
         document.getElementById('phaseDesc').textContent = '后端不可达';
       }
       renderHidden();
     }
+
+    // 主题选择器
+    (function initTheme() {
+      const sel = document.getElementById('themeSel');
+      for (const t of THEMES) {
+        const o = document.createElement('option');
+        o.value = t.id;
+        o.textContent = t.label;
+        sel.appendChild(o);
+      }
+      sel.addEventListener('change', async () => {
+        const note = document.getElementById('themeNote');
+        const r = await api('/api/apps/magpie-hana/routes/magpie-hana/theme', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ theme: sel.value }),
+        });
+        note.textContent = r && r.ok
+          ? '已设为：' + (sel.options[sel.selectedIndex] || {}).text + '（已打开的工作区最多 15 秒内跟上）'
+          : '保存失败：' + ((r && r.error) || '未知错误');
+        setTimeout(() => { note.textContent = ''; }, 4000);
+      });
+    })();
 
     document.getElementById('toggle').addEventListener('click', async () => {
       const st = await api('/api/apps/magpie-hana/routes/magpie-hana/status').catch(() => null);

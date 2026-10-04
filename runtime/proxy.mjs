@@ -19,9 +19,9 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { gzipSync, brotliCompressSync, constants as zlibConstants } from "node:zlib";
 const UPSTREAM_HOST = "127.0.0.1";
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const HOP_BY_HOP = new Set([
@@ -64,6 +64,33 @@ function mimeOf(url) {
   return MIME[path.slice(i)] || null;
 }
 
+// ── 压缩 ─────────────────────────────────────────────────────────────────────
+// 本地回环上不做压缩，首屏要裸传近 1.9MB（实测 app.js 839KB、i18n.js 287KB、
+// app.css 229KB）。文本类资源压一下能省七成。
+// 只压文本类；图片/字体本身就是压缩格式，再压反而更大。
+const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|x-javascript)|image\/svg)/i;
+
+function pickEncoding(req, contentType, upEncoding) {
+  if (upEncoding) return null;                    // 上游已编码，别二次压
+  if (!COMPRESSIBLE.test(String(contentType || ""))) return null;
+  const ae = String((req.headers && req.headers["accept-encoding"]) || "").toLowerCase();
+  if (/\bbr\b/.test(ae)) return "br";
+  if (/\bgzip\b/.test(ae)) return "gzip";
+  return null;
+}
+
+function compress(buf, enc) {
+  try {
+    if (enc === "br") {
+      // 质量 5：比默认 11 快一个量级，体积只多几个百分点
+      return brotliCompressSync(buf, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 5 } });
+    }
+    return gzipSync(buf, { level: 6 });
+  } catch {
+    return null;
+  }
+}
+
 const state = {
   listenPort: 0,
   upstreamPort: 0,
@@ -71,12 +98,74 @@ const state = {
   upstreamKey: "",
   hidden: new Set(DEFAULT_HIDDEN),
   themeAttr: "",
+  themeChoice: "auto",   // 主题设置：auto | 具体主题名（青夜/暖纸/…）
+  themeCss: "",
+  serverTheme: "",       // Hana 当前主题名（服务端从 preferences.json 读，作 auto 的兜底）
+  themeApplied: "",      // 实际生效的主题（诊断用）
   lastError: null,
   phase: "starting",   // starting | waiting-magpie | ready | error | stopping
   requests: 0,
   rewrites: 0,
   magpiePid: null,
 };
+
+// HANA_HOME/user/preferences.json 里的 appearance.theme。
+// 为什么服务端要读：卡片 iframe 里拿主题名有两条路——读父窗口的 data-theme、
+// 或宿主在 URL 上带 hana-theme 参数。实测本 App 的服务挂载模式下两者都不保证。
+// 所以再配一条完全不依赖网络与父窗口的：进程启动时自己读一次。
+// 代价是用户换了 Hana 主题后，服务端这份要等下一次 reload 才更新
+// （卡片侧的 MutationObserver 会先跟上，两者互为兜底）。
+function readHanaTheme() {
+  try {
+    const dataDir = process.cwd();                    // …\app-data\magpie-hana
+    const hanaHome = dirname(dirname(dataDir));       // …\.hanako
+    const f = join(hanaHome, "user", "preferences.json");
+    if (!existsSync(f)) return "";
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    const t = j && j.appearance && typeof j.appearance.theme === "string" ? j.appearance.theme : "";
+    return t && t !== "auto" ? t : "";
+  } catch {
+    return "";
+  }
+}
+
+// HANA 的 server-info.json（拿到宿主的 HTTP 端口，用来取主题 CSS）。
+function readHanaServerPort() {
+  try {
+    const dataDir = process.cwd();
+    const hanaHome = dirname(dirname(dataDir));
+    const f = join(hanaHome, "server-info.json");
+    if (!existsSync(f)) return 0;
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    return Number(j && j.port) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// 取宿主当前主题的 CSS 变量表。
+// 为什么由代理来取、而不让卡片里的脚本直接向宿主发请求：
+// 服务挂载模式下，页面里的 /api/apps/theme.css 可能被当成 magpie 自己的路径
+// （实测直接访问代理时就是 404，卡片里也不保证），由代理从回环向宿主取最稳。
+function fetchThemeCss(name) {
+  return new Promise((resolve) => {
+    const port = readHanaServerPort();
+    if (!port) return resolve({ ok: false, error: "读不到 HANA 的 server-info.json" });
+    const themeName = name || readHanaTheme();
+    const q = themeName ? `?theme=${encodeURIComponent(themeName)}` : "";
+    const req = httpRequest(
+      { host: "127.0.0.1", port, path: `/api/apps/theme.css${q}`, method: "GET", timeout: 6000 },
+      (r) => {
+        if (r.statusCode !== 200) { r.resume(); return resolve({ ok: false, error: `宿主返回 ${r.statusCode}` }); }
+        const chunks = [];
+        r.on("data", (c) => chunks.push(c));
+        r.on("end", () => resolve({ ok: true, theme: themeName || "(宿主默认)", css: Buffer.concat(chunks).toString("utf8") }));
+      });
+    req.on("timeout", () => { try { req.destroy(); } catch { /* 忽略 */ } resolve({ ok: false, error: "取主题超时" }); });
+    req.on("error", (e) => resolve({ ok: false, error: String(e && e.message || e) }));
+    req.end();
+  });
+}
 
 const log = (m) => process.stderr.write(`[magpie-hana] ${m}\n`);
 
@@ -87,18 +176,11 @@ const log = (m) => process.stderr.write(`[magpie-hana] ${m}\n`);
 // 用 !important 提升特异性，压过 magpie 自己的 :root / :root[data-theme]。
 const THEME_CLIENT = `<script id="hana-theme-client">
 (function(){
-  var THEME_URL = "/api/apps/theme.css";
   var STYLE_ID = "hana-theme";
   // 需要从宿主取的变量（Hana 的主题用这套命名）
   var WANT = ["--bg","--bg-card","--bg-glass","--sidebar-bg","--accent","--accent-hover",
               "--text","--text-light","--text-muted","--border","--shadow",
               "--green","--coral","--danger","--pop-bg"];
-
-  function parseVars(text){
-    var out = {}, re = /(--[A-Za-z0-9_-]+)\\s*:\\s*([^;}]+)/g, m;
-    while ((m = re.exec(text))) { out[m[1]] = m[2].trim(); }
-    return out;
-  }
 
   // 只从「祖先窗口」读，不读自己。
   // 卡片里本页是挂在宿主源下的 iframe，parent 就是 Hana（同源可读）；
@@ -123,19 +205,6 @@ const THEME_CLIENT = `<script id="hana-theme-client">
         }
         if (vars["--bg"] || vars["--text"]) return vars;
       } catch (e) { /* 跨源：继续向上，或放弃 */ }
-    }
-    return null;
-  }
-
-  function hostThemeName(){
-    var w = window;
-    try { if (!w.parent || w.parent === w) return null; } catch (e) { return null; }
-    for (var i = 0; i < 6; i++) {
-      try { if (!w.parent || w.parent === w) break; w = w.parent; } catch (e) { break; }
-      try {
-        var t = w.document && w.document.documentElement && w.document.documentElement.getAttribute("data-theme");
-        if (t && t !== "auto" && t !== "inherit") return t;
-      } catch (e) {}
     }
     return null;
   }
@@ -231,23 +300,17 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     } catch (e) {}
   }
 
-  var lastUrl = null;
-  function fetchByUrl(name){
-    var url = THEME_URL + (name ? "?theme=" + encodeURIComponent(name) : "");
-    if (url === lastUrl) return;
-    lastUrl = url;
-    var f = window.__hanaOrigFetch || window.fetch;
-    f.call(window, url, { credentials: "same-origin" })
-      .then(function(r){ return (r && r.ok) ? r.text() : ""; })
-      .then(function(t){ if (t) applyVars(parseVars(t)); })
-      .catch(function(){});
-  }
+  // 主题变量表由服务端备好（它是从宿主取的，且能看真实配置），
+  // 卡片脚本只负责套用。这样两种环境（卡片内 / 直接访问）行为一致。
+  if (window.__hanaVars && typeof window.__hanaVars === "object") applyVars(window.__hanaVars);
 
-  // 双层：先读宿主计算值（同一文档树，最准）；读不到再按主题名取 CSS
+  // auto 时优先读宿主已生效的计算值（同一文档树，最准，换主题能当场上跟着变）；
+  // 读不到就用服务端给的那份（直接访问代理、跨源时就是这样）。
+  // 固定主题：服务端给的已经是准的，不折腾。
   function refresh(){
+    if ((window.__hanaThemeChoice || "auto") !== "auto") return;
     var v = hostVars();
-    if (v) { applyVars(v); lastUrl = null; return; }
-    fetchByUrl(hostThemeName());
+    if (v) applyVars(v);
   }
 
   refresh();
@@ -259,15 +322,92 @@ const THEME_CLIENT = `<script id="hana-theme-client">
         .observe(top.document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
     }
   } catch (e) {}
+
+  // ── 避让宿主卡片右上角的按钮簇 ─────────────────────────────────
+  // 卡片里右上角悬浮着宿主的卡片按钮（设置/关闭），magpie 也把「设置」齿轮
+  // 贴在右上角，两者重叠。这里量宿主那些按钮的实际宽度（同源可读），
+  // 设成 CSS 变量；量不到就用默认值。
+  (function adapt(){
+    var gap = 112;
+    try {
+      var w = window;
+      while (w && w.parent && w.parent !== w) w = w.parent;
+      var d = w.document;
+      if (d) {
+        // 找卡片上贴右上角的悬浮按钮区（宿主命名不保证，多试几个选择器）
+        var cands = d.querySelectorAll('[class*="chrome"],[class*="titlebar"],[class*="card-actions"],[class*="_tabLifted"]');
+        var best = 0;
+        for (var i = 0; i < cands.length; i++) {
+          var el = cands[i], r = el.getBoundingClientRect();
+          // 只看真正贴在右上角、且在视口内的
+          if (r.width > 0 && r.height > 0 && r.top < 60 && r.right > w.innerWidth - 60) {
+            var need = (w.innerWidth - r.left) + 10;
+            if (need > best) best = need;
+          }
+        }
+        if (best > 0 && best < 400) gap = Math.ceil(best);
+      }
+    } catch (e) { /* 跨源或读不到：用默认值 */ }
+    try { document.documentElement.style.setProperty("--hana-chrome-gap", gap + "px"); } catch (e) {}
+  })();
+
+  // auto 且服务端给的是兜底值时，定期复核（宿主换主题时卡里的观察器先跟上）
   setInterval(refresh, 15000);
 })();
 </script>
 `;
 
+// 主题变量表：从宿主取一次，缓存起来。
+// auto 时主题名可能被用户改，缓存给个短 TTL；固定主题则永远不变。
+let themeCache = { at: 0, choice: null, vars: null };
+
+async function themeVars() {
+  const choice = state.themeChoice || "auto";
+  const ttl = choice === "auto" ? 10_000 : 60 * 60 * 1000;
+  const fresh = themeCache.vars && themeCache.choice === choice && (Date.now() - themeCache.at) < ttl;
+  if (fresh) return themeCache.vars;
+
+  const r = await fetchThemeCss(choice === "auto" ? "" : choice);
+  if (!r.ok) return themeCache.vars || null;   // 取不到就用旧的，不把页面搞硬
+  const vars = parseThemeVars(r.css);
+  if (!vars || !(vars["--bg"] || vars["--text"])) return themeCache.vars || null;
+  themeCache = { at: Date.now(), choice, vars };
+  state.themeApplied = r.theme || choice;
+  return vars;
+}
+
+function parseThemeVars(css) {
+  const out = {};
+  const re = /(--[A-Za-z0-9_-]+)\s*:\s*([^;}]+)/g;
+  let m;
+  while ((m = re.exec(css))) out[m[1]] = m[2].replace(/!important/gi, "").trim();
+  return out;
+}
+
 // 兜底：宿主侧推来的 css（现在不再由 index.js 推送，保留端点以防将来需要）
 function themeBlock() {
   if (!state.themeCss) return "";
   return `<style id="hana-theme-pushed">\n${state.themeCss}\n</style>\n`;
+}
+
+// 卡片内的适配：宿主在卡片右上角悬浮着它的卡片按钮簇（gecx/关闭），
+// magpie 自己的 header 也把「设置」齿轮贴在右上角，两者正好叠在一起 ——
+// 实测 magpie 齿轮在 y=10..36、x=最右，宿主 Chrome 就占那一块，齿轮被压住点不到。
+// 这里给 magpie 的 header 留出右侧安全区，把 .actions 整体推离右上角。
+// 只改摆放，不动 magpie 自身配色。
+const ADAPT_CSS = `html:root header.top{
+  padding-right: var(--hana-chrome-gap, 112px) !important;
+}
+html:root header.top #nav{
+  min-width: 0 !important;
+}
+html:root header.top .actions{
+  flex: none !important;
+}
+`;
+
+function adaptBlock() {
+  return `<style id="hana-adapt">\n${ADAPT_CSS}</style>\n`;
 }
 
 function hiddenBlock() {
@@ -340,13 +480,22 @@ const BASE_SHIM = `<script id="hana-base">
 </script>
 `;
 
-function inject(html) {
+function inject(html, vars) {
   let out = html;
+  // 主题选择的初始值 + 服务端备好的变量表，直接写进页面。
+  // （不依赖卡片里的 fetch：骨架里实测宿主并未给卡片 iframe 带上 hana-theme 参数，
+  //  而注入常量这条路径不靠任何网络请求，最稳。）
+  const seed =
+    `<script id="hana-theme-seed">window.__hanaThemeChoice=${JSON.stringify(state.themeChoice || "auto")};` +
+    `window.__hanaVars=${JSON.stringify(vars || null)};</script>\n`;
   // ① 垫片必须在 magpie 自己的脚本之前
-  if (/<head>/i.test(out)) out = out.replace(/<head>/i, "<head>" + BASE_SHIM);
-  else if (/<html([^>]*)>/i.test(out)) out = out.replace(/<html([^>]*)>/i, (m) => m + BASE_SHIM);
+  if (/<head>/i.test(out)) out = out.replace(/<head>/i, "<head>" + BASE_SHIM + seed);
+  else {
+    if (/<html([^>]*)>/i.test(out)) out = out.replace(/<html([^>]*)>/i, (m) => m + BASE_SHIM + seed);
+    else out = seed + out;
+  }
   // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
-  const tail = themeBlock() + hiddenBlock() + THEME_CLIENT;
+  const tail = themeBlock() + adaptBlock() + hiddenBlock() + THEME_CLIENT;
   if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
   else out += tail;
   state.rewrites += 1;
@@ -442,13 +591,45 @@ function proxyRequest(clientReq, clientRes) {
     }
 
     if (!isHtml) {
-      // 非 HTML：原样流式透传。但 MIME 必须可靠——见上方 MIME 注释。
+      // 非 HTML：原样透传，但 MIME 必须可靠（见上方 MIME 注释），
+      // 文本类则顺手压缩（本地回环不做压缩，裸传体积大得离谱）。
       if (!outHeaders["content-type"]) {
         const guess = mimeOf(clientReq.url);
         if (guess) outHeaders["content-type"] = guess;
       }
-      clientRes.writeHead(upRes.statusCode || 502, outHeaders);
-      upRes.pipe(clientRes);
+      const enc = pickEncoding(clientReq, outHeaders["content-type"], upRes.headers["content-encoding"]);
+      if (!enc) {
+        clientRes.writeHead(upRes.statusCode || 502, outHeaders);
+        upRes.pipe(clientRes);
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      upRes.on("data", (c) => {
+        chunks.push(c); size += c.length;
+        if (size > 64 * 1024 * 1024) { try { upRes.destroy(); } catch { /* 忽略 */ } }
+      });
+      upRes.on("end", () => {
+        const raw = Buffer.concat(chunks);
+        const packed = compress(raw, enc);
+        if (!packed) {   // 压缩失败：退回裸传，不能什么都不发
+          const h = { ...outHeaders, "content-length": String(raw.length) };
+          delete h["content-encoding"];
+          try {
+            if (!clientRes.headersSent) { clientRes.writeHead(upRes.statusCode || 200, h); clientRes.end(raw); }
+            else clientRes.end();
+          } catch { /* 忽略 */ }
+          return;
+        }
+        outHeaders["content-encoding"] = enc;
+        outHeaders["content-length"] = String(packed.length);
+        outHeaders.vary = outHeaders.vary ? outHeaders.vary + ", Accept-Encoding" : "Accept-Encoding";
+        try {
+          clientRes.writeHead(upRes.statusCode || 200, outHeaders);
+          clientRes.end(packed);
+        } catch { /* 忽略 */ }
+      });
+      upRes.on("error", () => { try { clientRes.end(); } catch { /* 忽略 */ } });
       return;
     }
 
@@ -460,11 +641,22 @@ function proxyRequest(clientReq, clientRes) {
       size += c.length;
       if (size > 32 * 1024 * 1024) { try { upRes.destroy(); } catch { /* 忽略 */ } }
     });
-    upRes.on("end", () => {
+    upRes.on("end", async () => {
       let text = Buffer.concat(chunks).toString("utf8");
-      try { text = inject(text); } catch (e) { state.lastError = "inject: " + String(e); }
-      const buf = Buffer.from(text, "utf8");
+      try {
+        // 页面要注入主题变量。变量表从宿主取（取不到就用上一次的缓存）。
+        const vars = await themeVars();
+        text = inject(text, vars);
+      } catch (e) { state.lastError = "inject: " + String(e); }
+      let buf = Buffer.from(text, "utf8");
       outHeaders["content-type"] = ct || "text/html; charset=utf-8";
+      const enc = pickEncoding(clientReq, outHeaders["content-type"], "");
+      const packed = enc ? compress(buf, enc) : null;
+      if (packed) {
+        outHeaders["content-encoding"] = enc;
+        outHeaders.vary = "Accept-Encoding";
+        buf = packed;
+      }
       outHeaders["content-length"] = String(buf.length);
       try {
         clientRes.writeHead(upRes.statusCode || 200, outHeaders);
@@ -522,7 +714,23 @@ async function handleInternal(req, res) {
       requests: state.requests, rewrites: state.rewrites,
       recent: state.recent.slice(-30),
       theme: state.themeAttr,
+      themeChoice: state.themeChoice,
+      themeApplied: state.themeApplied,
+      themeVarsCached: !!(themeCache && themeCache.vars),
     });
+    return true;
+  }
+
+  // 主题选择（auto / 具体主题名）。GET 给注入的客户端脚本读，POST 由设置页改。
+  if (path === "/_hana/theme" && req.method === "GET") {
+    const want = new URL(req.url || "/", "http://x").searchParams.get("theme");
+    if (want) {
+      // 卡片脚本可以按名要一套；auto 时用宿主的当前主题
+      const r = await fetchThemeCss(want === "auto" ? "" : want);
+      if (!r.ok) return sendJson(res, { ok: false, error: r.error || "取主题失败" }, 502);
+      return sendJson(res, { ok: true, theme: r.theme, vars: parseThemeVars(r.css) });
+    }
+    sendJson(res, { ok: true, theme: state.themeChoice, applied: state.themeApplied, appearance: state.themeAttr });
     return true;
   }
 
@@ -530,7 +738,11 @@ async function handleInternal(req, res) {
     const b = await readJson(req);
     if (typeof b.css === "string") state.themeCss = b.css;   // 保留兼容
     if (typeof b.appearance === "string") state.themeAttr = b.appearance;
-    sendJson(res, { ok: true, theme: state.themeAttr });
+    if (typeof b.theme === "string" && b.theme) {
+      state.themeChoice = b.theme;
+      themeCache = { at: 0, choice: null, vars: null };   // 换了主题：缓存作废
+    }
+    sendJson(res, { ok: true, theme: state.themeChoice, appearance: state.themeAttr });
     return true;
   }
 
@@ -623,7 +835,7 @@ function shutdown() {
 }
 
 function main() {
-  const opts = { exe: "", cwd: "", port: 0, marker: "", hidden: null };
+  const opts = { exe: "", cwd: "", port: 0, marker: "", hidden: null, theme: null };
   for (const a of process.argv.slice(2)) {
     const i = a.indexOf("=");
     if (i < 0) continue;
@@ -633,10 +845,14 @@ function main() {
     else if (k === "--port") opts.port = parseInt(v, 10) || 0;
     else if (k === "--marker") opts.marker = v;
     else if (k === "--hidden") opts.hidden = v;
+    else if (k === "--theme") opts.theme = v;
   }
   if (opts.hidden !== null) {
     state.hidden = new Set(opts.hidden.split(",").map((s) => s.trim()).filter(Boolean));
   }
+  if (opts.theme) state.themeChoice = opts.theme;
+  state.serverTheme = readHanaTheme();
+  log(`Hana 主题（服务端读）：${state.serverTheme || "（未读到）"}`);
 
   server = createServer((req, res) => {
     if ((req.url || "").startsWith("/_hana/")) {
@@ -647,7 +863,6 @@ function main() {
     }
     proxyRequest(req, res);
   });
-
   server.on("error", (e) => {
     state.phase = "error";
     state.lastError = `代理监听失败（端口 ${opts.port}）：${e && e.message}`;
