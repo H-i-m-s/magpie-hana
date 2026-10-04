@@ -1,0 +1,56 @@
+{
+  "manifestVersion": 2,
+  "id": "magpie-hana",
+  "name": "Magpie",
+  "version": "0.1.0",
+  "description": "把 magpie（yetone 的多 agent 模型统一管理器）包装成 Hana 的原生一部分：exe 随包携带、装完即用；Hana 启动即拉起无托盘的 magpie web，Hana 关闭即随之停止；整页工作区经反代挂载 magpie 官方界面并适配 Hana 主题，可按需隐藏用不到的功能；magpie 工具让 Agent 能查模型清单、额度、各 agent 当前模型并直接切换。内置 magpie 为 MIT 许可（© 2026 yetone），原件见 vendor/LICENSE-magpie。",
+  "entry": "index.js",
+  "icon": "assets/icon.svg",
+  "minAppVersion": "0.1023.0",
+  "network": {
+    "allowedHosts": [
+      "127.0.0.1"
+    ],
+    "methods": [
+      "GET",
+      "POST",
+      "PUT",
+      "DELETE"
+    ],
+    "allowLocalhost": true,
+    "defaultTimeoutMs": 15000,
+    "maxResponseBytes": 8388608
+  },
+  "capabilities": [
+    "app/runtime.execute",
+    "app/runtime.local-machine",
+    "app/runtime.network",
+    "app/tools.expose-to-model"
+  ],
+  "contributes": {
+    "cards": [
+      {
+        "id": "workspace",
+        "title": "Magpie",
+        "description": "整页工作区：经反代挂载 magpie 官方界面，配色适配 Hana 主题",
+        "realization": "page",
+        "siteNavEntry": true,
+        "fpFullPanel": true,
+        "cardForm": "edge-to-edge",
+        "service": {
+          "id": "magpie-ui",
+          "path": "/"
+        },
+        "face": {
+          "image": "assets/cover.svg"
+        }
+      }
+    ],
+    "settings": {
+      "title": "Magpie",
+      "ui": {
+        "route": "/settings.html"
+      }
+    }
+  }
+}

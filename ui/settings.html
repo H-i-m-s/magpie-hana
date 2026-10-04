@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Magpie 设置</title>
+  <link rel="stylesheet" href="./assets/app-ui.css">
+  <style>
+    body { margin: 0; padding: 18px 20px; font: 13.5px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif; }
+    h2 { font-size: 15px; margin: 0 0 4px; }
+    .hint { opacity: .65; font-size: 12px; margin: 0 0 16px; }
+    .card { border: 1px solid var(--line, rgba(128,128,128,.22)); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 7px 0; }
+    .row + .row { border-top: 1px solid var(--line, rgba(128,128,128,.14)); }
+    .who { min-width: 0; }
+    .name { font-size: 13.5px; }
+    .desc { opacity: .6; font-size: 12px; margin-top: 2px; }
+    .kv { opacity: .75; font-size: 12.5px; margin-top: 8px; }
+    select, button { font: inherit; padding: 5px 12px; border-radius: 8px; }
+    button { cursor: pointer; }
+    #status { margin-top: 10px; font-size: 12.5px; opacity: .7; }
+  </style>
+</head>
+<body>
+  <h2>Magpie</h2>
+  <p class="hint">把 magpie 接入 Hana 的桥。exe 与它的全部数据都在本 App 的数据目录里，不写你的用户目录。</p>
+
+  <div class="card">
+    <div class="row">
+      <div class="who">
+        <div class="name">运行状态</div>
+        <div class="desc" id="phaseDesc">正在读取…</div>
+      </div>
+      <button id="toggle">启动 / 停止</button>
+    </div>
+    <div class="kv" id="kv"></div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="who">
+        <div class="name">工作区里隐藏的功能</div>
+        <div class="desc">只隐藏入口，不解除底层能力。改动立即生效，重新打开工作区即可看到。</div>
+      </div>
+    </div>
+    <div id="hiddenList"></div>
+  </div>
+
+  <script type="module">
+    const FEATURES = [
+      { id: 'library', label: 'Library（往各 agent 写指令/MCP/skill）' },
+      { id: 'sessions', label: 'Sessions（magpie 自己的会话日志）' },
+      { id: 'routing', label: 'Routing（路由组）' },
+      { id: 'stats', label: 'Usage 页签' },
+      { id: 'gateway', label: 'Gateway 页' },
+      { id: 'settings-otel', label: '设置 · Observability' },
+      { id: 'settings-sync', label: '设置 · Sync and backup' },
+      { id: 'settings-privacy', label: '设置 · Privacy' },
+    ];
+    let hidden = [];
+
+    async function api(path, init) {
+      const r = await fetch(path, init);
+      return r.json();
+    }
+
+    function renderHidden() {
+      const box = document.getElementById('hiddenList');
+      box.innerHTML = '';
+      for (const f of FEATURES) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const who = document.createElement('div');
+        who.className = 'who';
+        const nm = document.createElement('div');
+        nm.className = 'name';
+        nm.textContent = f.label;
+        who.appendChild(nm);
+        const btn = document.createElement('button');
+        const on = hidden.includes(f.id);
+        btn.textContent = on ? '已隐藏' : '显示中';
+        btn.onclick = async () => {
+          hidden = on ? hidden.filter((x) => x !== f.id) : [...hidden, f.id];
+          await api('/api/apps/magpie-hana/routes/magpie-hana/hidden', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ hidden }),
+          });
+          renderHidden();
+        };
+        row.appendChild(who);
+        row.appendChild(btn);
+        box.appendChild(row);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const st = await api('/api/apps/magpie-hana/routes/magpie-hana/status');
+        hidden = Array.isArray(st.hidden) ? st.hidden : [];
+        const desc = document.getElementById('phaseDesc');
+        const kv = document.getElementById('kv');
+        const map = { ready: '运行中', starting: '启动中', idle: '已停止', error: '出错', disabled: '已停用' };
+        desc.textContent = map[st.phase] || st.phase;
+        kv.textContent = [
+          `代理端口 ${st.proxyPort || '—'}`,
+          `magpie 网页 ${st.upstreamPort ? '127.0.0.1:' + st.upstreamPort : '—'}`,
+          `网关 3425 ${st.gateway && st.gateway.ok ? '活着（v' + st.gateway.version + '，' + st.gateway.models + ' 个模型）' : '不可达'}`,
+        ].join(' · ');
+        if (st.lastError) document.getElementById('status').textContent = '最近错误：' + st.lastError;
+        else document.getElementById('status').textContent = '';
+      } catch (e) {
+        document.getElementById('phaseDesc').textContent = '后端不可达';
+      }
+      renderHidden();
+    }
+
+    document.getElementById('toggle').addEventListener('click', async () => {
+      const st = await api('/api/apps/magpie-hana/routes/magpie-hana/status').catch(() => null);
+      const running = st && (st.phase === 'ready' || st.phase === 'starting');
+      await api(`/api/apps/magpie-hana/routes/magpie-hana/${running ? 'stop' : 'start'}`, { method: 'POST' });
+      setTimeout(refresh, 600);
+    });
+
+    refresh();
+    setInterval(refresh, 4000);
+  </script>
+</body>
+</html>

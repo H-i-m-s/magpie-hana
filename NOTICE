@@ -1,0 +1,32 @@
+Magpie for Hana — 第三方代码声明
+Copyright (c) 2026 H-i-M-s
+
+本 App 整体以 MIT 授权，许可证全文见同目录 LICENSE。
+
+
+## 内置的 magpie
+
+本 App 的 vendor/ 目录随包分发 magpie 的可执行文件。
+
+  magpie
+  Copyright (c) 2026 yetone
+  源码地址：https://github.com/yetone/magpie
+  许可证：MIT（原件见 vendor/LICENSE-magpie）
+
+MIT 明确允许复制、发布、再授权与销售，唯一义务是保留版权声明与许可证全文，
+这两项均已随包保留。
+
+本 App 未修改 magpie 的任何源码。它与 magpie 的关系仅限于：
+
+  - 通过命令行启动 magpie（`magpie web`）
+  - 通过它公开的 HTTP 接口读取模型清单与额度
+  - 反代它自己提供的网页界面，用于在 Hana 内呈现
+
+## 随包分发的 Hana App SDK
+
+本 App 的 sdk/ 与 ui/assets/ 下的运行时来自 HanaAgent 官方 App SDK
+（由官方脚手架 create_hana_app.py 拷贝入包），版权归 HanaAgent 项目所有。
+其中的法律与第三方声明保留在原处：
+  ui/assets/app-ui.js.LEGAL.txt
+  ui/assets/THIRD_PARTY_NOTICES.txt
+  sdk/THIRD_PARTY_NOTICES.txt
