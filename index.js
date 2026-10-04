@@ -17,7 +17,8 @@
 import { defineApp } from "./sdk/app-contract/server-client.js";
 import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const APP_ID = "magpie-hana";
 const APP_VERSION = "0.1.0";
@@ -30,9 +31,6 @@ const SERVICE_ID = "magpie-ui";
 const READY_MAX_MS = 90_000;
 const READY_POLL_MS = 400;
 const RETRY_DELAYS_MS = [3_000, 10_000, 30_000, 60_000];
-
-const CAP_RUNTIME = "app/runtime.execute";
-const CAP_LOCAL = "app/runtime.local-machine";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -47,7 +45,9 @@ export default defineApp(async (sdk) => {
 
   const dataDir = sdk.dataDir;
   if (typeof dataDir !== "string" || !dataDir) throw new Error("magpie-hana: sdk.dataDir 缺失");
-  const appRoot = new URL(".", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+  // 安装目录（只读）。用 fileURLToPath 而不是手工剥前导斜杠——
+  // Windows 上后者会得到 C:/... 而非 C:\...，且对含空格的路径不够稳。
+  const appRoot = dirname(fileURLToPath(import.meta.url));
   const binDir = join(dataDir, "bin");
   const exePath = join(binDir, "magpie.exe");
   const magpieDataDir = join(binDir, "data");
@@ -114,37 +114,22 @@ export default defineApp(async (sdk) => {
     return { seeded: true, path: exePath, size };
   }
 
-  // ── 能力探测 ──────────────────────────────────────────────────────────────
-  async function capabilityMap() {
-    try {
-      const res = await sdk.bus.request("app:capabilities", {});
-      const map = {};
-      for (const c of (res && Array.isArray(res.capabilities) ? res.capabilities : [])) {
-        if (c && typeof c.capability === "string") map[c.capability] = c.status;
-      }
-      return map;
-    } catch (e) {
-      warn(`app:capabilities 查询失败：${msgOf(e)}`);
-      return null;
-    }
-  }
-
-  async function hasCap(word) {
-    const m = await capabilityMap();
-    if (!m) return false;
-    const s = m[word];
-    return s === "granted" || s === "allowed" || s === true;
-  }
-
   // ── 代理 HTTP 调用（本进程 <-> proxy.mjs）─────────────────────────────────
+  // 这是「调本 App 自己已注册的受管服务」，用 sdk.runtime.fetch：宿主把 origin
+  // 固定为该记录的 127.0.0.1:<port>，每次重查 app/runtime.execute 授权。
+  // runtime.fetch 需 runtimeId；尚未拿到时退回 network.fetch（同机回环，清单已允许）。
   async function proxyJson(path, init) {
     if (!state.proxyPort) throw new Error("代理未就绪");
-    const url = `http://127.0.0.1:${state.proxyPort}${path}`;
-    const res = await sdk.network.fetch(url, {
-      timeoutMs: 15000,
-      maxResponseBytes: 4 * 1024 * 1024,
-      ...init,
-    });
+    const opts = { timeoutMs: 10000, ...init };
+    let res;
+    if (state.runtimeId && sdk.runtime && typeof sdk.runtime.fetch === "function") {
+      res = await sdk.runtime.fetch(state.runtimeId, path, opts);
+    } else {
+      res = await sdk.network.fetch(`http://127.0.0.1:${state.proxyPort}${path}`, {
+        maxResponseBytes: 4 * 1024 * 1024,
+        ...opts,
+      });
+    }
     const text = await res.text();
     return JSON.parse(text);
   }
@@ -171,8 +156,7 @@ export default defineApp(async (sdk) => {
     if (!sdk.runtime || typeof sdk.runtime.start !== "function") {
       throw new Error("宿主 ctx.runtime 不可用（app/runtime.execute 未授予或宿主过旧）");
     }
-    if (!(await hasCap(CAP_RUNTIME))) throw new Error(`缺少能力：${CAP_RUNTIME}`);
-    if (!(await hasCap(CAP_LOCAL))) throw new Error(`缺少能力：${CAP_LOCAL}`);
+    // 不自己预检能力：授权与否由 runtime.start 报错，那才是权威的。
 
     seedExe();
     mkdirSync(magpieDataDir, { recursive: true });
