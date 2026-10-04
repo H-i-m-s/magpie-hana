@@ -306,32 +306,61 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     }
   } catch (e) {}
 
-  // ── 避让宿主卡片右上角的按钮簇 ─────────────────────────────────
-  // 卡片里右上角悬浮着宿主的卡片按钮（设置/关闭），magpie 也把「设置」齿轮
-  // 贴在右上角，两者重叠。这里量宿主那些按钮的实际宽度（同源可读），
-  // 设成 CSS 变量；量不到就用默认值。
+  // ── 避让宿主卡片右上角悬浮的按钮簇 ───────────────────────────
+  // 宿主在卡片右上角悬浮着它的按钮簇（设置/关闭）。magpie 的头部已改成两行，
+  // ↻ ⚙ 挪到了第二行；这里再量出那一簇到底往下占了多少，写成 --hana-head-safe，
+  // 让第一行（品牌那一行）的高度刚好把它躲开，第二行整行就都在它下面。
+  //
+  // 不猜宿主的类名：用 elementsFromPoint 在「本视口右上角」几个点上问
+  // 「谁压在最上面」，一直数到遇上本 iframe 为止——之前那些就是压在卡片上的
+  // 悬浮层。取它们相对本视口顶部的最大下探深度，就是需要让出的高度。
   (function adapt(){
+    var safe = 48;      // 量不到时的兜底
     var gap = 112;
-    try {
-      var w = window;
-      while (w && w.parent && w.parent !== w) w = w.parent;
-      var d = w.document;
-      if (d) {
-        // 找卡片上贴右上角的悬浮按钮区（宿主命名不保证，多试几个选择器）
-        var cands = d.querySelectorAll('[class*="chrome"],[class*="titlebar"],[class*="card-actions"],[class*="_tabLifted"]');
-        var best = 0;
-        for (var i = 0; i < cands.length; i++) {
-          var el = cands[i], r = el.getBoundingClientRect();
-          // 只看真正贴在右上角、且在视口内的
-          if (r.width > 0 && r.height > 0 && r.top < 60 && r.right > w.innerWidth - 60) {
-            var need = (w.innerWidth - r.left) + 10;
-            if (need > best) best = need;
-          }
+    function measure(){
+      if (!window.parent || window.parent === window) return null;   // 直接访问代理：没有宿主层
+      var frame = null;
+      try { frame = window.frameElement; } catch (err) {}
+      if (!frame) return null;
+      var par, d, vw, fTop = 0;
+      try { par = window.parent; d = par.document; vw = par.innerWidth || 0; } catch (err) { return null; }
+      if (!d || !d.elementsFromPoint) return null;
+      try { fTop = frame.getBoundingClientRect().top; } catch (err) {}
+      var deepest = 0, widest = 0;
+      var pts = [[vw - 18, fTop + 16], [vw - 54, fTop + 16], [vw - 18, fTop + 38], [vw - 92, fTop + 20]];
+      for (var i = 0; i < pts.length; i++) {
+        var list;
+        try { list = d.elementsFromPoint(pts[i][0], pts[i][1]); } catch (err) { continue; }
+        for (var k = 0; k < list.length; k++) {
+          var el = list[k];
+          if (el === frame || el.contains(frame)) break;   // 到本 iframe 就停
+          var r;
+          try { r = el.getBoundingClientRect(); } catch (err) { continue; }
+          if (r.width <= 0 || r.height <= 0) continue;
+          if (r.bottom < fTop) continue;                   // 整块在本视口上方：无关
+          var below = r.bottom - fTop;
+          if (below > deepest) deepest = below;
+          var right = vw - r.left;
+          if (right > widest) widest = right;
         }
-        if (best > 0 && best < 400) gap = Math.ceil(best);
       }
-    } catch (e) { /* 跨源或读不到：用默认值 */ }
-    try { document.documentElement.style.setProperty("--hana-chrome-gap", gap + "px"); } catch (e) {}
+      if (deepest <= 0) return null;
+      return { safe: Math.ceil(deepest) + 6, gap: Math.ceil(widest) + 8 };
+    }
+    function run(){
+      var m = null;
+      try { m = measure(); } catch (err) {}
+      if (m) { safe = m.safe; gap = m.gap; }
+      try {
+        var rs = document.documentElement.style;
+        rs.setProperty("--hana-head-safe", safe + "px");
+        rs.setProperty("--hana-chrome-gap", gap + "px");
+      } catch (err) {}
+    }
+    run();
+    // 宿主的悬浮层可能比本页面晚一点布局好，补两次复核
+    setTimeout(run, 700);
+    setTimeout(run, 2200);
   })();
 
   // auto 且服务端给的是兜底值时，定期复核（宿主换主题时卡里的观察器先跟上）
@@ -373,19 +402,64 @@ function themeBlock() {
   return `<style id="hana-theme-pushed">\n${state.themeCss}\n</style>\n`;
 }
 
-// 卡片内的适配：宿主在卡片右上角悬浮着它的卡片按钮簇（gecx/关闭），
-// magpie 自己的 header 也把「设置」齿轮贴在右上角，两者正好叠在一起 ——
-// 实测 magpie 齿轮在 y=10..36、x=最右，宿主 Chrome 就占那一块，齿轮被压住点不到。
-// 这里给 magpie 的 header 留出右侧安全区，把 .actions 整体推离右上角。
-// 只改摆放，不动 magpie 自身配色。
+// 卡片里的头部布局改造。
+//
+// 背景：宿主在卡片右上角悬浮它的按钮簇（设置/关闭）。magpie 原生把 ↻ 刷新与
+// ⚙ 设置放在头部右端，正好叠在那一块：既不好看，也点不到。
+//
+// magpie 自己会在宽度 >=800px 时隐藏品牌名、把头塌成单行 44px（实测：header 的
+// class 变成 `top tight cramped inrow crowded packed`，`.brand{display:none}`，
+// .actions 回到 y=9）——所以只调 order/padding 在宽卡片下会失效，必须接管布局。
+//
+// 这里固定两行：
+//   第 1 行：品牌（只占左边一小块，右侧整块留给宿主按钮簇）
+//   第 2 行：标签栏 + ↻ ⚙（图标跟在标签栏右端）
+// 第 1 行高度走 `--hana-head-safe`（客户端量出宿主按钮簇实际占用后写入，默认 48px），
+// 保证第 2 行整行都在宿主按钮簇下方，两者不重叠。
+//
+// 为什么用 grid：flex-wrap 下 #nav 是 flex:0 0 100%，改 order 会把它自己占满一行、
+// .actions 被挤到第三行；grid 的模板区能把两者确定性地锁在同一行。
 const ADAPT_CSS = `html:root header.top{
-  padding-right: var(--hana-chrome-gap, 112px) !important;
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto !important;
+  grid-template-areas: "brand ." "nav actions" !important;
+  align-items: center !important;
+  column-gap: 10px !important;
+  row-gap: 2px !important;
+  height: auto !important;
+  padding: 0 12px 8px 12px !important;
+}
+html:root header.top .brand{
+  grid-area: brand !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  min-height: var(--hana-head-safe, 48px) !important;
+  height: auto !important;
+}
+html:root header.top .brand > span:not(.logo){
+  display: inline !important;
 }
 html:root header.top #nav{
+  grid-area: nav !important;
+  position: relative !important;
+  left: auto !important;
+  top: auto !important;
+  transform: none !important;
+  margin: 0 !important;
   min-width: 0 !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  scrollbar-width: none !important;
+}
+html:root header.top #nav::-webkit-scrollbar{
+  display: none !important;
 }
 html:root header.top .actions{
+  grid-area: actions !important;
+  margin-left: 0 !important;
   flex: none !important;
+  align-self: center !important;
 }
 `;
 
