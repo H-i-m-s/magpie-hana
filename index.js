@@ -198,6 +198,7 @@ export default defineApp(async (sdk) => {
       throw new Error(`宿主拒绝启动受管 runtime（${code}）：${raw}`);
     }
     state.runtimeId = rt?.runtimeId || rt?.id || null;
+    log(`运行时 id = ${state.runtimeId}`);
     // 端口是我们自己选的，当场就能确定——不用等状态查询回报。
     // （早期版本这里有死锁：查询要先有端口、端口要等查询，白等满 90s）
     state.proxyPort = port;

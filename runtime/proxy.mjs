@@ -21,7 +21,6 @@ import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { gzipSync, brotliCompressSync, constants as zlibConstants } from "node:zlib";
 const UPSTREAM_HOST = "127.0.0.1";
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const HOP_BY_HOP = new Set([
@@ -64,32 +63,15 @@ function mimeOf(url) {
   return MIME[path.slice(i)] || null;
 }
 
-// ── 压缩 ─────────────────────────────────────────────────────────────────────
-// 本地回环上不做压缩，首屏要裸传近 1.9MB（实测 app.js 839KB、i18n.js 287KB、
-// app.css 229KB）。文本类资源压一下能省七成。
-// 只压文本类；图片/字体本身就是压缩格式，再压反而更大。
-const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|x-javascript)|image\/svg)/i;
-
-function pickEncoding(req, contentType, upEncoding) {
-  if (upEncoding) return null;                    // 上游已编码，别二次压
-  if (!COMPRESSIBLE.test(String(contentType || ""))) return null;
-  const ae = String((req.headers && req.headers["accept-encoding"]) || "").toLowerCase();
-  if (/\bbr\b/.test(ae)) return "br";
-  if (/\bgzip\b/.test(ae)) return "gzip";
-  return null;
-}
-
-function compress(buf, enc) {
-  try {
-    if (enc === "br") {
-      // 质量 5：比默认 11 快一个量级，体积只多几个百分点
-      return brotliCompressSync(buf, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 5 } });
-    }
-    return gzipSync(buf, { level: 6 });
-  } catch {
-    return null;
-  }
-}
+// ── 压缩：代理不自行压缩 ──────────
+// v0.3.0 曾给文本资源上 br/gzip，结果卡片里所有 CSS/JS 全加载失败。
+// 根因（已用对照实验证实）：宿主的受管服务转发用的是 Node 的 fetch()，
+// 它自动解压 body，却原样保留 content-encoding / content-length 头；
+// 转到浏览器就成了「明文 body + 声明是 br」，浏览器解压失败，资源整批挂掉。
+// 实验（本地回环，原始 674B -> br 87B）：fetch() 拿到的 content-encoding="br"、
+// content-length="87"，而 body 已是 698 字节明文。
+// 结论：只要响应会经过宿主转发，代理就不能自行压缩。
+// 上游 magpie 自己也不压，所以也没有「透传上游压缩」这条路。
 
 const state = {
   listenPort: 0,
@@ -107,6 +89,7 @@ const state = {
   requests: 0,
   rewrites: 0,
   magpiePid: null,
+  diag: [],              // 诊断：入站原始请求头 + 卡片内部上报的页面上下文
 };
 
 // HANA_HOME/user/preferences.json 里的 appearance.theme。
@@ -439,11 +422,45 @@ function hiddenBlock() {
 const BASE_SHIM = `<script id="hana-base">
 (function(){
   var p = location.pathname;
-  // 未经改写的原语：本页脚本要访问宿主自己的资源（/api/apps/theme.css）时用它，
-  // 免得被下面这层前缀垫片二次拼接。
+  // 未经改写的原语
   window.__hanaOrigFetch = window.fetch;
   window.__hanaXhrOpen = window.XMLHttpRequest && XMLHttpRequest.prototype.open;
   var base = (p.length > 1 && p.charAt(p.length - 1) === '/') ? p.slice(0, -1) : p;
+  window.__hanaMount = (base && base !== '/') ? base : '';
+
+  // ── 诊断上报（必须在 return 之前，否则 base 为空时什么都上报不了）──
+  function report(kind, extra){
+    try {
+      var url = (window.__hanaMount || '') + '/_hana/diag';
+      var payload = JSON.stringify(Object.assign({
+        kind: kind, href: String(location.href), pathname: String(location.pathname),
+        base: base, readyState: document.readyState, t: Date.now()
+      }, extra || {}));
+      var f = window.__hanaOrigFetch;
+      if (f) { f.call(window, url, { method: 'POST', body: payload, headers: {'Content-Type':'application/json'}, keepalive: true }).catch(function(){}); return; }
+      if (navigator.sendBeacon) navigator.sendBeacon(url, payload);
+    } catch (e) {}
+  }
+  window.__hanaDiag = report;
+  report('boot');
+  window.addEventListener('DOMContentLoaded', function(){ report('dom-ready'); });
+  window.addEventListener('load', function(){
+    var sheets = 0; try { sheets = document.styleSheets.length; } catch (e) {}
+    report('load', { sheets: sheets });
+  });
+  window.addEventListener('error', function(e){
+    var t = e.target;
+    if (t && t.tagName && (t.tagName === 'LINK' || t.tagName === 'SCRIPT' || t.tagName === 'IMG')) {
+      report('resource-error', { tag: t.tagName, url: String(t.src || t.href || ''), rel: String(t.rel || '') });
+    }
+  }, true);
+  setTimeout(function(){
+    var sheets = 0; try { sheets = document.styleSheets.length; } catch (e) {}
+    var links = [];
+    try { links = [].slice.call(document.querySelectorAll('link[rel=stylesheet]'), 0, 6).map(function(l){ return l.href; }); } catch (e) {}
+    report('snapshot', { sheets: sheets, linkCount: links.length, links: links });
+  }, 3000);
+
   if (!base || base === '/') return;
   function fix(u){
     if (typeof u !== 'string' || !u) return u;
@@ -536,9 +553,9 @@ function servicePath(url) {
   return m ? (m[1] || "/") : url;
 }
 
-function note(url, status, ct) {
+function note(url, status, ct, extra) {
   try {
-    state.recent.push({ t: Date.now(), url, path: servicePath(url), status, ct: ct || "" });
+    state.recent.push({ t: Date.now(), url, path: servicePath(url), status, ct: ct || "", ...(extra || {}) });
     if (state.recent.length > 40) state.recent.shift();
   } catch { /* 忽略 */ }
 }
@@ -551,6 +568,17 @@ function proxyRequest(clientReq, clientRes) {
     return;
   }
   state.requests += 1;
+  // 头五个请求记下全部入站头：诊断「宿主到底把什么转给我」
+  if (state.requests <= 5) {
+    try {
+      state.diag.push({
+        at: new Date().toISOString(), kind: "inbound",
+        url: clientReq.url, method: clientReq.method,
+        headers: clientReq.headers,
+      });
+      if (state.diag.length > 80) state.diag.shift();
+    } catch { /* 忽略 */ }
+  }
 
   const headers = {};
   for (const [k, v] of Object.entries(clientReq.headers)) {
@@ -576,7 +604,10 @@ function proxyRequest(clientReq, clientRes) {
     const urlPath = String(clientReq.url || "").split("?")[0].toLowerCase();
     const hasExt = /\.[a-z0-9]{1,8}$/.test(urlPath);
     const isHtml = /text\/html/i.test(ct) || (ct === "" && (!hasExt || urlPath.endsWith(".html")));
-    note(clientReq.url, upRes.statusCode || 0, ct);
+    note(clientReq.url, upRes.statusCode || 0, ct, {
+      ae: String(clientReq.headers["accept-encoding"] || ""),
+      ce: String(upRes.headers["content-encoding"] || ""),
+    });
 
     // 非 HTML 原样透传（连 content-type / content-length / content-encoding 一起），
     // 只对要注入重算的 HTML 剥掉这三个。
@@ -591,45 +622,14 @@ function proxyRequest(clientReq, clientRes) {
     }
 
     if (!isHtml) {
-      // 非 HTML：原样透传，但 MIME 必须可靠（见上方 MIME 注释），
-      // 文本类则顺手压缩（本地回环不做压缩，裸传体积大得离谱）。
+      // 非 HTML：原样透传（含上游的 content-encoding / content-length）。
+      // MIME 必须可靠——见上方 MIME 注释；压缩一律不做，见上方「代理不自行压缩」。
       if (!outHeaders["content-type"]) {
         const guess = mimeOf(clientReq.url);
         if (guess) outHeaders["content-type"] = guess;
       }
-      const enc = pickEncoding(clientReq, outHeaders["content-type"], upRes.headers["content-encoding"]);
-      if (!enc) {
-        clientRes.writeHead(upRes.statusCode || 502, outHeaders);
-        upRes.pipe(clientRes);
-        return;
-      }
-      const chunks = [];
-      let size = 0;
-      upRes.on("data", (c) => {
-        chunks.push(c); size += c.length;
-        if (size > 64 * 1024 * 1024) { try { upRes.destroy(); } catch { /* 忽略 */ } }
-      });
-      upRes.on("end", () => {
-        const raw = Buffer.concat(chunks);
-        const packed = compress(raw, enc);
-        if (!packed) {   // 压缩失败：退回裸传，不能什么都不发
-          const h = { ...outHeaders, "content-length": String(raw.length) };
-          delete h["content-encoding"];
-          try {
-            if (!clientRes.headersSent) { clientRes.writeHead(upRes.statusCode || 200, h); clientRes.end(raw); }
-            else clientRes.end();
-          } catch { /* 忽略 */ }
-          return;
-        }
-        outHeaders["content-encoding"] = enc;
-        outHeaders["content-length"] = String(packed.length);
-        outHeaders.vary = outHeaders.vary ? outHeaders.vary + ", Accept-Encoding" : "Accept-Encoding";
-        try {
-          clientRes.writeHead(upRes.statusCode || 200, outHeaders);
-          clientRes.end(packed);
-        } catch { /* 忽略 */ }
-      });
-      upRes.on("error", () => { try { clientRes.end(); } catch { /* 忽略 */ } });
+      clientRes.writeHead(upRes.statusCode || 502, outHeaders);
+      upRes.pipe(clientRes);
       return;
     }
 
@@ -650,13 +650,13 @@ function proxyRequest(clientReq, clientRes) {
       } catch (e) { state.lastError = "inject: " + String(e); }
       let buf = Buffer.from(text, "utf8");
       outHeaders["content-type"] = ct || "text/html; charset=utf-8";
-      const enc = pickEncoding(clientReq, outHeaders["content-type"], "");
-      const packed = enc ? compress(buf, enc) : null;
-      if (packed) {
-        outHeaders["content-encoding"] = enc;
-        outHeaders.vary = "Accept-Encoding";
-        buf = packed;
-      }
+      // 不压缩 HTML。
+      // 教训：v0.3.0 为了提速给 HTML 也上了 br/gzip，随后卡片就停在 loading、
+      // 一个脚本都不执行（部署在宿主卡片 iframe 里时）。而同样的响应在
+      // 「用 node 直接请求代理」时完全正常——因为两者路径不同。
+      // 页面 HTML 本来只有 45KB，压不压差别很小，不值得赌。
+      delete outHeaders["content-encoding"];
+      delete outHeaders["vary"];
       outHeaders["content-length"] = String(buf.length);
       try {
         clientRes.writeHead(upRes.statusCode || 200, outHeaders);
@@ -706,6 +706,20 @@ function sendJson(res, obj, status = 200) {
 async function handleInternal(req, res) {
   const path = (req.url || "/").split("?")[0];
 
+  if (path === "/_hana/diag") {
+    if (req.method === "POST") {
+      const b = await readJson(req);
+      try {
+        state.diag.push({ at: new Date().toISOString(), kind: "page", ...b });
+        if (state.diag.length > 80) state.diag.shift();
+      } catch { /* 忽略 */ }
+      sendJson(res, { ok: true });
+      return true;
+    }
+    sendJson(res, { ok: true, count: state.diag.length, diag: state.diag.slice(-30) });
+    return true;
+  }
+
   if (path === "/_hana/status") {
     sendJson(res, {
       ok: true, phase: state.phase, port: state.listenPort,
@@ -717,6 +731,7 @@ async function handleInternal(req, res) {
       themeChoice: state.themeChoice,
       themeApplied: state.themeApplied,
       themeVarsCached: !!(themeCache && themeCache.vars),
+      diagCount: state.diag.length,
     });
     return true;
   }
