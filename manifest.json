@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "magpie-hana",
   "name": "Magpie-Hana",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "把 magpie（yetone 的多 agent 模型统一管理器）包装成 Hana 的原生一部分：exe 随包携带、装完即用；Hana 启动即拉起无托盘的 magpie web，Hana 关闭即随之停止；一张卡片内嵌 magpie 官方界面（经反代），配色可跟随 Hana 主题或固定为指定主题，可按需隐藏用不到的功能；magpie 工具让 Agent 能查模型清单、额度、各 agent 当前模型并直接切换。内置 magpie 为 MIT 许可（© 2026 yetone），原件见 vendor/LICENSE-magpie。",
   "entry": "index.js",
   "icon": "assets/icon.svg",
