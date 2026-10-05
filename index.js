@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ID = "magpie-hana";
-const APP_VERSION = "0.4.0";
+const APP_VERSION = "0.5.0";
 
 const PROXY_ENTRY = "runtime/proxy.mjs";
 const VENDOR_EXE = "vendor/magpie-windows-amd64.exe";

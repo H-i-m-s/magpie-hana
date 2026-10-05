@@ -4,21 +4,175 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Magpie-Hana 设置</title>
+  <script>
+    /* 宿主把当前主题经 iframe URL 下发：hana-css（当前主题完整 CSS）与
+       auto 模式的 hana-palette-{light,dark}-css。挂上它，页面才随宿主主题一起变。
+       没有参数时（离线预览）退回下面 :root 里的默认值。
+       做法抄自 doc-intake / llama-monitor 的设置页。
+
+       注：本页早先漏了这一段 —— 于是设置页永远显示暖色默认值，
+       跟用户在 Hana 里用的主题对不上。 */
+    (function () {
+      try {
+        var p = new URLSearchParams(location.search);
+        var href = p.get("hana-css");
+        var appearance = p.get("hana-theme-appearance");
+        if (appearance) {
+          var themed = p.get("hana-palette-" + appearance + "-css");
+          if (themed) href = themed;
+        }
+        if (!href) return;
+        var link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = href;
+        link.setAttribute("data-host-theme", "1");
+        document.head.insertBefore(link, document.head.firstChild);
+      } catch (e) {
+        /* 主题不可用不影响设置功能 */
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="./assets/app-ui.css">
   <style>
-    body { margin: 0; padding: 18px 20px; font: 13.5px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif; }
-    h2 { font-size: 15px; margin: 0 0 4px; }
-    .hint { opacity: .65; font-size: 12px; margin: 0 0 16px; }
-    .card { border: 1px solid var(--line, rgba(128,128,128,.22)); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
-    .row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 7px 0; }
-    .row + .row { border-top: 1px solid var(--line, rgba(128,128,128,.14)); }
+    /* ── 变量层 ────────────────────────────────────────────────────────────
+       宿主主题注入的是 --bg / --bg-card / --text / --accent 这一套；
+       这里映射成本页自己的 --s-*，缺什么都有兜底，离线预览也能看。 */
+    :root {
+      --s-card: var(--bg-card, #fffdf9);
+      --s-text: var(--text, #2f2a24);
+      --s-sub: var(--text-light, #6f6659);
+      --s-muted: var(--text-muted, #8d8274);
+      --s-accent: var(--accent, #537D96);
+      --s-tint: var(--accent-light, rgba(83, 125, 150, 0.10));
+      --s-line: var(--border, rgba(0, 0, 0, 0.12));
+      --s-danger: var(--danger, #C0616B);
+      --s-hover: var(--overlay-subtle, rgba(0, 0, 0, 0.04));
+      --s-r: calc(12px * var(--corner-radius-scale, 1));
+      --s-r-sm: calc(8px * var(--corner-radius-scale, 1));
+    }
+
+    * { scrollbar-width: thin; scrollbar-color: rgba(128, 128, 128, 0.3) transparent; }
+    html, body { margin: 0; background: transparent; }
+    body {
+      padding: 18px 20px 22px;
+      color: var(--s-text);
+      font-family: var(--font-ui, -apple-system, "Segoe UI", system-ui, sans-serif);
+      font-size: 13.5px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    h2 { font-size: 15px; margin: 0 0 4px; color: var(--s-text); }
+    .hint { color: var(--s-muted); font-size: 12px; margin: 0 0 16px; }
+
+    .card {
+      background: var(--s-card);
+      border: 1px solid var(--s-line);
+      border-radius: var(--s-r);
+      padding: 12px 16px 14px;
+      margin-bottom: 12px;
+    }
+    .row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 8px 0; }
+    .row + .row { border-top: 1px solid var(--s-line); }
     .who { min-width: 0; }
-    .name { font-size: 13.5px; }
-    .desc { opacity: .6; font-size: 12px; margin-top: 2px; }
-    .kv { opacity: .75; font-size: 12.5px; margin-top: 8px; }
-    select, button { font: inherit; padding: 5px 12px; border-radius: 8px; }
-    button { cursor: pointer; }
-    #status { margin-top: 10px; font-size: 12.5px; opacity: .7; }
+    .name { font-size: 13.5px; color: var(--s-text); }
+    .desc { color: var(--s-muted); font-size: 12px; margin-top: 2px; }
+    .kv { color: var(--s-sub); font-size: 12.5px; margin-top: 8px; }
+    #status { margin-top: 8px; font-size: 12.5px; color: var(--s-danger); }
+
+    .s-btn {
+      font: inherit;
+      font-size: 12.5px;
+      padding: 5px 14px;
+      border-radius: var(--s-r-sm);
+      border: 1px solid var(--s-line);
+      background: var(--s-card);
+      color: var(--s-text);
+      cursor: pointer;
+      transition: background var(--duration-fast, .15s) var(--ease-out, ease),
+                  border-color var(--duration-fast, .15s) var(--ease-out, ease);
+      white-space: nowrap;
+    }
+    .s-btn:hover { background: var(--s-hover); }
+    .s-btn:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
+    .s-btn--primary { background: var(--s-accent); border-color: var(--s-accent); color: #fff; }
+    .s-btn--primary:hover { filter: brightness(1.06); }
+
+    /* 隐藏功能：用面板里的 hana-toggle 开关（app-ui.css 已带样式） */
+    .feat {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 7px 0;
+    }
+    .feat + .feat { border-top: 1px solid var(--s-line); }
+    .feat__name { font-size: 13px; color: var(--s-text); }
+    .feat__right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    .feat__state { font-size: 12px; color: var(--s-muted); min-width: 3em; text-align: right; }
+
+    /* ── 自绘下拉（骨架抄自 git-save-load 的 HanaSelect）────────────────────
+       原生 <select> 仍是状态源，只负责存值；下面这套负责视觉与交互。
+       为什么不用原生：它的弹出选项面板由系统绘制，深色卡片里会突兀地
+       亮一块，且无法跟随主题。 */
+    .hs { position: relative; display: inline-flex; }
+    .hs-trigger {
+      display: inline-flex; align-items: center; justify-content: space-between;
+      gap: 8px;
+      min-width: 190px;
+      padding: 6px 10px 6px 12px;
+      font: inherit; font-size: 13px;
+      color: var(--s-text);
+      background: var(--s-card);
+      border: 1px solid var(--s-line);
+      border-radius: var(--s-r-sm);
+      cursor: pointer;
+      user-select: none;
+      transition: border-color var(--duration-fast, .15s) var(--ease-out, ease),
+                  box-shadow var(--duration-fast, .15s) var(--ease-out, ease);
+    }
+    .hs-trigger:hover { border-color: var(--s-muted); }
+    .hs-trigger:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
+    .hs.open .hs-trigger { border-color: var(--s-accent); box-shadow: 0 0 0 3px var(--s-tint); }
+    .hs-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hs-chev {
+      flex-shrink: 0; width: 11px; height: 11px; opacity: .55;
+      transition: transform var(--duration-fast, .15s) var(--ease-out, ease);
+      background-repeat: no-repeat; background-position: center; background-size: contain;
+      background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+    }
+    .hs.open .hs-chev { transform: rotate(180deg); }
+
+    .hs-panel {
+      position: fixed; z-index: 3000;
+      background: var(--s-card);
+      border: 1px solid var(--s-line);
+      border-radius: var(--s-r-sm);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, .20), 0 2px 8px rgba(0, 0, 0, .10);
+      padding: 4px;
+      min-width: 190px;
+      max-height: 268px;
+      overflow-y: auto;
+      opacity: 0;
+      transform: scale(.97) translateY(-4px);
+      transform-origin: top left;
+      transition: opacity .12s ease, transform .12s ease;
+      pointer-events: none;
+    }
+    .hs-panel.open { opacity: 1; transform: none; pointer-events: auto; }
+    .hs-opt {
+      position: relative;
+      padding: 7px 12px 7px 28px;
+      font-size: 13px;
+      color: var(--s-text);
+      border-radius: calc(var(--s-r-sm) - 3px);
+      cursor: pointer;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      transition: background var(--duration-fast, .15s) var(--ease-out, ease);
+    }
+    .hs-opt:hover { background: var(--s-hover); }
+    .hs-opt[aria-selected="true"] { color: var(--s-accent); font-weight: 600; }
+    .hs-opt[aria-selected="true"]::before {
+      content: "\2713"; position: absolute; left: 10px;
+      color: var(--s-accent); font-size: 11px;
+    }
+    .hs-sep { height: 1px; margin: 4px 6px; background: var(--s-line); }
   </style>
 </head>
 <body>
@@ -31,7 +185,7 @@
         <div class="name">运行状态</div>
         <div class="desc" id="phaseDesc">正在读取…</div>
       </div>
-      <button id="toggle">启动 / 停止</button>
+      <button class="s-btn" id="toggle">启动 / 停止</button>
     </div>
     <div class="kv" id="kv"></div>
     <div id="status"></div>
@@ -43,7 +197,14 @@
         <div class="name">主题</div>
         <div class="desc">自动 = 跟随 Hana 当前主题，你在 Hana 里换，卡片里 5 秒内跟上。也可以让 magpie 固定用某一套 Hana 主题。<br>magpie 自己设置页里的「外观（跟随系统 / 浅色 / 深色）」仍然可用，会自动对应到 Hana 的浅色/深色主题。</div>
       </div>
-      <select id="themeSel"></select>
+      <div class="hs" id="themeHs">
+        <button class="hs-trigger" id="themeTrigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <span class="hs-label" id="themeLabel">自动（跟随 Hana）</span>
+          <span class="hs-chev" aria-hidden="true"></span>
+        </button>
+      </div>
+      <!-- 原生 select 藏起来当状态源；自绘下拉只负责视觉与交互 -->
+      <select id="themeSel" hidden></select>
     </div>
     <div id="themeNote" class="kv"></div>
   </div>
@@ -59,6 +220,48 @@
   </div>
 
   <script type="module">
+    // 用 SDK 发请求。为什么不能用裸 fetch：设置页跑在宿主的沙箱 iframe 里，
+    // 路由端要一个凭据（宿主在 iframe URL 里以 appSurfaceSession 下发，
+    // SDK 会把它转成 X-Hana-App-Surface-Session 头）。裸 fetch 带不上，
+    // 结果所有写操作都是 403 forbidden —— 而且是静默的，界面看着正常。
+    // 同项目的 git-save-load / doc-intake / llama-monitor 设置页都走这条。
+    import { hana } from './assets/sdk.js';
+
+    // 路由相对于本 App 的 routes 根。SDK 会拼成
+    //   /api/apps/magpie-hana/routes/magpie-hana/<path>
+    // 并注入宿主下发的凭据头。注意不能传 /api/... 绝对路径：
+    // SDK 的 normalizePluginApiPath 会直接拒绝。
+    const ROUTE = '/magpie-hana';
+    const ABS_PREFIX = '/api/apps/magpie-hana/routes';
+
+    // 优先走 SDK（它会注入宿主下发的 appSurfaceSession 凭据头）。
+    // 只有在「拿不到凭据」时才退回裸 fetch —— 这种情形只出现在宿主之外的
+    // 离线预览里；真实设置页永远走上面那条。
+    //
+    // 为什么不能用裸 fetch 当主路：设置页跑在宿主的沙箱 iframe 里，
+    // 路由端要求凭据；裸 fetch 带不上，所有写操作都是 403，
+    // 而且是静默的（界面看着正常）。同项目的 git-save-load /
+    // doc-intake / llama-monitor 设置页都走 hana.api.fetch。
+    async function api(path, init) {
+      let sdkErr = null;
+      try {
+        const r = await hana.api.fetch(path, init);
+        // 403 说明凭据没生效，给裸 fetch 一次机会（离线预览）。
+        // 其余状态码是真实业务应答，直接返回。
+        if (r.ok || r.status !== 403) return r.json();
+        sdkErr = 'HTTP 403';
+      } catch (e) {
+        const msg = (e && e.message) || '';
+        if (!msg.includes('appSurfaceSession')) throw e;   // 真错，不静默吞
+        sdkErr = msg;
+      }
+      try {
+        const r = await fetch(ABS_PREFIX + path, init);
+        return r.json();
+      } catch {
+        return { ok: false, error: 'SDK 不可用：' + sdkErr };
+      }
+    }
     const FEATURES = [
       { id: 'library', label: 'Library（往各 agent 写指令/MCP/skill）' },
       { id: 'sessions', label: 'Sessions（magpie 自己的会话日志）' },
@@ -71,7 +274,7 @@
     ];
 
     // Hana 的全部内置主题（取自 Hana 的 lib/theme.js，共 11 套）。
-    // 注意："浅色"/"深色" 不是 Hana 主题（宿主对这两个名字返回空），
+    // 注意："浅色"/"深色" 不是 Hana 主题（宿主对这两个名字返回空 CSS），
     // 它们是 magpie 自己的外观选项，由 magpie 设置页管。这里不再列。
     const THEMES = [
       { id: 'auto', label: '自动（跟随 Hana）' },
@@ -87,97 +290,229 @@
       { id: 'deep-think', label: 'Deep Think' },
       { id: 'coral', label: '珊瑚' },
     ];
-    let hidden = [];
 
-    async function api(path, init) {
-      const r = await fetch(path, init);
-      return r.json();
+    // ══ 自绘下拉（骨架来自 git-save-load 的 HanaSelect，按本页需要精简）══
+    function createDropdown(rootId, options, currentValue, onChange) {
+      const root = document.getElementById(rootId);
+      const trigger = root.querySelector('.hs-trigger');
+      const label = root.querySelector('.hs-label');
+
+      const panel = document.createElement('div');
+      panel.className = 'hs-panel';
+      panel.setAttribute('role', 'listbox');
+      panel.hidden = true;
+      document.body.appendChild(panel);
+
+      let value = currentValue;
+      let open = false;
+
+      const optEls = [];
+      options.forEach((o, i) => {
+        if (o.sepBefore) {
+          const sep = document.createElement('div');
+          sep.className = 'hs-sep';
+          panel.appendChild(sep);
+        }
+        const el = document.createElement('div');
+        el.className = 'hs-opt';
+        el.setAttribute('role', 'option');
+        el.dataset.value = o.id;
+        el.textContent = o.label;
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          setValue(o.id, true);
+          close();
+        });
+        panel.appendChild(el);
+        optEls.push(el);
+      });
+
+      function labelOf(v) {
+        const f = options.find((o) => o.id === v);
+        return f ? f.label : (options[0] ? options[0].label : '');
+      }
+      function refresh() {
+        label.textContent = labelOf(value);
+        optEls.forEach((el) => el.setAttribute('aria-selected', el.dataset.value === value ? 'true' : 'false'));
+      }
+      function setValue(v, fire) {
+        if (value === v) return;
+        value = v;
+        refresh();
+        if (fire && typeof onChange === 'function') onChange(v);
+      }
+      function place() {
+        const tr = trigger.getBoundingClientRect();
+        const vh = window.innerHeight || document.documentElement.clientHeight || 480;
+        const vw = window.innerWidth || document.documentElement.clientWidth || 320;
+        const gap = 4, pad = 8;
+        panel.style.minWidth = Math.max(190, tr.width) + 'px';
+        panel.style.left = tr.left + 'px';
+        panel.style.top = (tr.bottom + gap) + 'px';
+        panel.style.maxHeight = '268px';
+        const ph = panel.offsetHeight;
+        // 下方空间不足就翻到触发器上面
+        if (tr.bottom + gap + ph > vh - pad) {
+          const above = tr.top - gap - ph;
+          if (above >= pad) {
+            panel.style.top = above + 'px';
+          } else {
+            panel.style.maxHeight = Math.max(120, vh - tr.bottom - pad - gap) + 'px';
+            panel.style.top = (tr.bottom + gap) + 'px';
+          }
+        }
+        const pw = panel.offsetWidth;
+        if (tr.left + pw > vw - pad) {
+          panel.style.left = Math.max(pad, vw - pw - pad) + 'px';
+        }
+      }
+      function openPanel() {
+        panel.hidden = false;
+        place();
+        // 先定位再上类，保证过渡从正确位置展开
+        requestAnimationFrame(() => {
+          panel.classList.add('open');
+          root.classList.add('open');
+          trigger.setAttribute('aria-expanded', 'true');
+        });
+        open = true;
+      }
+      function close() {
+        if (!open) return;
+        open = false;
+        panel.classList.remove('open');
+        root.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');
+        setTimeout(() => { if (!open) panel.hidden = true; }, 130);
+      }
+      function toggle() { open ? close() : openPanel(); }
+
+      trigger.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+      trigger.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+        else if (e.key === 'Escape') close();
+      });
+      document.addEventListener('click', close);
+      // 页面滚动 / 尺寸变化时面板会跟丢，直接关掉最稳
+      window.addEventListener('scroll', close, true);
+      window.addEventListener('resize', close);
+      document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+
+      refresh();
+      return {
+        sync(v) { value = v; refresh(); },
+        get value() { return value; },
+      };
     }
+
+    const themeSel = document.getElementById('themeSel');
+    for (const t of THEMES) {
+      const o = document.createElement('option');
+      o.value = t.id;
+      o.textContent = t.label;
+      themeSel.appendChild(o);
+    }
+
+    const themeDrop = createDropdown(
+      'themeHs',
+      THEMES.map((t, i) => ({ ...t, sepBefore: i === 1 })), // 自动 / 具体主题 之间加一条细分隔
+      'auto',
+      async (v) => {
+        const note = document.getElementById('themeNote');
+        const r = await api(`${ROUTE}/theme`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ theme: v }),
+        });
+        const text = (THEMES.find((t) => t.id === v) || {}).label || v;
+        note.textContent = r && r.ok
+          ? '已设为：' + text + '（已打开的工作区最多 15 秒内跟上）'
+          : '保存失败：' + ((r && r.error) || '未知错误');
+        setTimeout(() => { note.textContent = ''; }, 4000);
+      },
+    );
+
+    // ══ 隐藏功能 ══
+    let hidden = [];
 
     function renderHidden() {
       const box = document.getElementById('hiddenList');
       box.innerHTML = '';
       for (const f of FEATURES) {
         const row = document.createElement('div');
-        row.className = 'row';
-        const who = document.createElement('div');
-        who.className = 'who';
+        row.className = 'feat';
+
         const nm = document.createElement('div');
-        nm.className = 'name';
+        nm.className = 'feat__name';
         nm.textContent = f.label;
-        who.appendChild(nm);
-        const btn = document.createElement('button');
+
+        const right = document.createElement('div');
+        right.className = 'feat__right';
+        const state = document.createElement('span');
+        state.className = 'feat__state';
         const on = hidden.includes(f.id);
-        btn.textContent = on ? '已隐藏' : '显示中';
-        btn.onclick = async () => {
+        state.textContent = on ? '已隐藏' : '显示中';
+
+        const sw = document.createElement('button');
+        sw.className = 'hana-toggle';
+        sw.type = 'button';
+        sw.setAttribute('role', 'switch');
+        sw.setAttribute('aria-label', f.label);
+        if (on) sw.setAttribute('data-checked', '');
+        sw.setAttribute('aria-checked', on ? 'true' : 'false');
+        sw.addEventListener('click', async () => {
           hidden = on ? hidden.filter((x) => x !== f.id) : [...hidden, f.id];
-          await api('/api/apps/magpie-hana/routes/magpie-hana/hidden', {
+          await api(`${ROUTE}/hidden`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ hidden }),
           });
           renderHidden();
-        };
-        row.appendChild(who);
-        row.appendChild(btn);
+        });
+
+        right.appendChild(state);
+        right.appendChild(sw);
+        row.appendChild(nm);
+        row.appendChild(right);
         box.appendChild(row);
       }
     }
 
     async function refresh() {
       try {
-        const st = await api('/api/apps/magpie-hana/routes/magpie-hana/status');
+        const st = await api(`${ROUTE}/status`);
         hidden = Array.isArray(st.hidden) ? st.hidden : [];
-        const desc = document.getElementById('phaseDesc');
-        const kv = document.getElementById('kv');
         const map = { ready: '运行中', starting: '启动中', idle: '已停止', error: '出错', disabled: '已停用' };
-        desc.textContent = map[st.phase] || st.phase;
-        kv.textContent = [
+        document.getElementById('phaseDesc').textContent = map[st.phase] || st.phase;
+        document.getElementById('kv').textContent = [
           `代理端口 ${st.proxyPort || '—'}`,
           `magpie 网页 ${st.upstreamPort ? '127.0.0.1:' + st.upstreamPort : '—'}`,
           `网关 3425 ${st.gateway && st.gateway.ok ? '活着（v' + st.gateway.version + '，' + st.gateway.models + ' 个模型）' : '不可达'}`,
         ].join(' · ');
-        if (st.lastError) document.getElementById('status').textContent = '最近错误：' + st.lastError;
-        else document.getElementById('status').textContent = '';
-        const sel = document.getElementById('themeSel');
-        if (sel && st.theme) sel.value = st.theme;
+        document.getElementById('status').textContent = st.lastError ? '最近错误：' + st.lastError : '';
+        if (st.theme) {
+          themeSel.value = st.theme;
+          themeDrop.sync(st.theme);
+        }
       } catch (e) {
         document.getElementById('phaseDesc').textContent = '后端不可达';
       }
       renderHidden();
     }
 
-    // 主题选择器
-    (function initTheme() {
-      const sel = document.getElementById('themeSel');
-      for (const t of THEMES) {
-        const o = document.createElement('option');
-        o.value = t.id;
-        o.textContent = t.label;
-        sel.appendChild(o);
-      }
-      sel.addEventListener('change', async () => {
-        const note = document.getElementById('themeNote');
-        const r = await api('/api/apps/magpie-hana/routes/magpie-hana/theme', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ theme: sel.value }),
-        });
-        note.textContent = r && r.ok
-          ? '已设为：' + (sel.options[sel.selectedIndex] || {}).text + '（已打开的工作区最多 15 秒内跟上）'
-          : '保存失败：' + ((r && r.error) || '未知错误');
-        setTimeout(() => { note.textContent = ''; }, 4000);
-      });
-    })();
-
     document.getElementById('toggle').addEventListener('click', async () => {
-      const st = await api('/api/apps/magpie-hana/routes/magpie-hana/status').catch(() => null);
+      const st = await api(`${ROUTE}/status`).catch(() => null);
       const running = st && (st.phase === 'ready' || st.phase === 'starting');
-      await api(`/api/apps/magpie-hana/routes/magpie-hana/${running ? 'stop' : 'start'}`, { method: 'POST' });
+      await api(`${ROUTE}/${running ? 'stop' : 'start'}`, { method: 'POST' });
       setTimeout(refresh, 600);
     });
 
-    refresh();
+    (async function boot() {
+      // 先等 SDK 就绪再用 api（宿主会先建立 session）。
+      // 兄弟 App（git-save-load / llama-monitor）都这么做。
+      try { await hana.ready(); } catch (e) { /* 离线预览时没有宿主，忽略 */ }
+      refresh();
+    })();
     setInterval(refresh, 4000);
   </script>
 </body>
