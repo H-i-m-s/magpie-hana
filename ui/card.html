@@ -45,12 +45,11 @@
 
   function connect() {
     tries += 1;
-    fetch(ABS + "/status", { credentials: "same-origin" })
-      .then(function (r) { return r.json(); })
+    readStatus()
       .then(function (j) {
         var port = j && (j.proxyPort || (j.live && j.live.proxyPort));
         if (!port) {
-          show("<b>magpie 还没就绪</b><br>当前状态：" + ((j && j.phase) || "未知") + "。稍后自动重试…");
+          show("<b>magpie 还没就绪</b><br>当前状态：" + ((j && j.phase) || "未知") + "<br>应答：" + JSON.stringify(j).slice(0, 220) + "<br>稍后自动重试…");
           setTimeout(connect, 1200);
           return;
         }
@@ -65,6 +64,19 @@
         show("<b>读不到代理端口</b><br>" + String((e && e.message) || e) + "<br>稍后自动重试…");
         setTimeout(connect, Math.min(1500 * tries, 6000));
       });
+  }
+
+  // 读 App 路由的 /status。为什么不能裸 fetch：路由端要求凭据，裸 fetch 带不上，
+  // 会静默 403（设置页那边踩过同样的坑）。载荷里 route 相对于 App 的 routes 根。
+  function readStatus() {
+    var sdk = window.hana && window.hana.api && window.hana.api.fetch;
+    if (sdk) {
+      return Promise.resolve(window.hana.api.fetch("/magpie-hana/status")).then(function (r) { return r.json(); });
+    }
+    return fetch(ABS + "/status", { credentials: "same-origin" }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status + "（没有 Hana SDK，裸 fetch 拿不到凭据）");
+      return r.json();
+    });
   }
 
   function announceShell() {
