@@ -114,8 +114,17 @@
   }
 
   function postTiming(phase) {
+    var globals = [];
     try {
-      frame.contentWindow.postMessage({ type: "magpie-hana:timing", phase: phase, t0: T0, t1: Date.now() }, "*");
+      globals = Object.keys(window).filter(function (k) { return /hana|sdk|surface|card/i.test(k); }).slice(0, 8);
+    } catch (_) {}
+    try {
+      frame.contentWindow.postMessage({
+        type: "magpie-hana:timing", phase: phase, t0: T0, t1: Date.now(),
+        sdk: !!(window.hana && window.hana.api && window.hana.api.fetch),
+        q: String(location.search || "").slice(0, 120),
+        globals: globals
+      }, "*");
     } catch (_) {}
   }
 
