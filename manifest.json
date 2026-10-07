@@ -27,6 +27,14 @@
     "app/runtime.network",
     "app/tools.expose-to-model"
   ],
+  "ui": {
+    "csp": {
+      "frameDomains": [
+        "http://127.0.0.1",
+        "http://localhost"
+      ]
+    }
+  },
   "contributes": {
     "cards": [
       {
@@ -34,10 +42,7 @@
         "title": "Magpie-Hana",
         "description": "一张卡内嵌 magpie 官方界面（经反代），配色跟随 Hana 主题，可放到任意页面随时查看",
         "cardForm": "edge-to-edge",
-        "service": {
-          "id": "magpie-ui",
-          "path": "/"
-        },
+        "route": "/card.html",
         "face": {
           "image": "assets/cover.svg"
         }

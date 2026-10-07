@@ -272,6 +272,16 @@ const THEME_CLIENT = `<script id="hana-theme-client">
   }
   var BASE = mountBase();
 
+  // 卡片壳（route 卡片把代理页放进 iframe）会主动打个招呼。收到之后就认定
+  // 「主题选择的持久化要走壳子代转」：壳子与 App 路由同源，我们不同源，
+  // 直接 POST 会被同源策略挡掉。壳子也会在每帧主动重复打招呼，避免我们
+  // 加载慢一步而错过第一声。
+  var hanaShell = false;
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (d && d.type === "magpie-hana:shell") hanaShell = true;
+  });
+
   // ── 变量表 ───────────────────────────────────────────────────────────
   // seedVars：服务端随页面注入的「首屏变量表」（就是宿主当前的配色）。
   // 它是**一张变量表**，不是「主题名 -> 变量表」的映射，所以单独放，
@@ -809,6 +819,14 @@ const SELECT_CLIENT = `<script id="hana-select-client">
     return s;
   }
   function postChoice(id) {
+    // 卡片壳模式：交给壳子代转（壳子 POST App 路由，且能带同源凭据）。
+    if (hanaShell) {
+      try {
+        window.parent.postMessage({ type: "magpie-hana:choice", theme: id }, "*");
+        report("theme-choice-post", { via: "card-shell", theme: id });
+        return;
+      } catch (e) { /* 掉下去走老路径 */ }
+    }
     var session = surfaceSession();
     if (!session) {
       report("theme-choice-post", { via: "proxy", theme: id, reason: "no-session" });

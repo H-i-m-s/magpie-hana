@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Magpie</title>
+<!--
+  这层壳为什么存在（2026-10-08）：
+
+  Hana 的卡片分两种。route 型的文档由 Hana 自己的 app-host 伺服，宿主与文档之间的
+  「可信握手」瞬间完成，卡片秒开（图库、token-tracker 就是这样）。service 型的
+  文档来自 App 自己的服务（我们原来是这种），而那个握手只认 Hana 自己签发的文档：
+  宿主发 chrome-challenge、等文档回话，magpie 的页面当然不会回，于是**每次打开都要
+  等超时才放行**——实测 5 秒左右，页面本身只要 0.2 秒。
+
+  所以这里改成 route 型：这张由 Hana 伺服的小页面负责握手（瞬间完成），它再把真正的
+  magpie 界面放进一个 iframe。内嵌 127.0.0.1 的权限在 manifest 的 ui.csp.frameDomains
+  里声明（CSP 里 http://127.0.0.1 不带端口即匹配任意端口），代理端口是每次启动随机挑的，
+  所以只能这样声明。
+
+  壳子还兼一个桥：主题选择的持久化要落到 App 的路由（ui.json 的唯一写入方），那个地址
+  和 iframe 不同源，所以由这里代转。
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
+  #frame { border: 0; width: 100%; height: 100%; display: block; }
+  #msg { color: #8b98a5; font: 13px/1.7 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 18px; }
+  #msg b { color: #c9d4e0; font-weight: 600; }
+</style>
+</head>
+<body>
+<div id="msg"><b>正在连接 magpie…</b></div>
+<iframe id="frame" style="display:none" allow="clipboard-read; clipboard-write"></iframe>
+<script>
+(function () {
+  var ABS = "/api/apps/magpie-hana/routes/magpie-hana";
+  var frame = document.getElementById("frame");
+  var msg = document.getElementById("msg");
+  var tries = 0;
+
+  function show(text) {
+    msg.innerHTML = text;
+    msg.style.display = "block";
+    frame.style.display = "none";
+  }
+
+  function connect() {
+    tries += 1;
+    fetch(ABS + "/status", { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var port = j && (j.proxyPort || (j.live && j.live.proxyPort));
+        if (!port) {
+          show("<b>magpie 还没就绪</b><br>当前状态：" + ((j && j.phase) || "未知") + "。稍后自动重试…");
+          setTimeout(connect, 1200);
+          return;
+        }
+        frame.src = "http://127.0.0.1:" + port + "/";
+        frame.style.display = "block";
+        msg.style.display = "none";
+        // 反复打几声招呼：iframe 里的脚本可能比我们晚一步就绪，
+        // 收到之后它才会把主题选择的持久化交给这里代转。
+        announceShell();
+      })
+      .catch(function (e) {
+        show("<b>读不到代理端口</b><br>" + String((e && e.message) || e) + "<br>稍后自动重试…");
+        setTimeout(connect, Math.min(1500 * tries, 6000));
+      });
+  }
+
+  function announceShell() {
+    [80, 400, 1200, 2500, 5000].forEach(function (d) {
+      setTimeout(function () {
+        try { frame.contentWindow.postMessage({ type: "magpie-hana:shell" }, "*"); } catch (_) {}
+      }, d);
+    });
+  }
+
+  // 主题选择的持久化：iframe 里的页面把选择发过来，这里落到 App 路由。
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || d.type !== "magpie-hana:choice") return;
+    fetch(ABS + "/theme", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ theme: d.theme })
+    })
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (j) {
+        try { frame.contentWindow.postMessage({ type: "magpie-hana:choice-result", ok: true, data: j }, "*"); } catch (_) {}
+      })
+      .catch(function (err) {
+        try { frame.contentWindow.postMessage({ type: "magpie-hana:choice-result", ok: false, error: String((err && err.message) || err) }, "*"); } catch (_) {}
+      });
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>
