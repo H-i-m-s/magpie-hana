@@ -54,7 +54,7 @@
           setTimeout(connect, 1200);
           return;
         }
-        frame.src = "http://127.0.0.1:" + port + "/";
+        frame.src = "http://127.0.0.1:" + port + "/?shellT0=" + T0;
         frame.style.display = "block";
         msg.style.display = "none";
         postTiming("src-set");
