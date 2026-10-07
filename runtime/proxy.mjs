@@ -279,24 +279,8 @@ const THEME_CLIENT = `<script id="hana-theme-client">
   var hanaShell = false;
   window.addEventListener("message", function (e) {
     var d = e.data;
-    if (!d || typeof d !== "object") return;
-    if (d.type === "magpie-hana:shell") hanaShell = true;
-    // 壳子（route 卡片的薄页面）会把它那边的时刻发进来，用来把
-    // 「壳子开始 → 卡片就绪」与页面自己的时钟对齐；卡片那几秒到底落在谁身上，
-    // 靠这条时间线判断，而不是靠猜。
-    if (d.type === "magpie-hana:timing") {
-      // 注意：/_hana/diag 的 kind 是白名单，自定义 kind 会被丢掉（card-shell
-      // 那次就全丢了）。所以一律走 probe，把内容放在字段里。
-      report("probe", { probe: "card-shell", phase: d.phase, t0: d.t0, t1: d.t1, now: Date.now(), sdk: d.sdk });
-    }
+    if (d && d.type === "magpie-hana:shell") hanaShell = true;
   });
-
-  // 壳子把自己的 T0 放在 iframe 的查询串里（见 ui/card.html）：比 postMessage 早，
-  // 没有竞赛，也不受 kind 白名单影响。
-  function shellT0FromUrl() {
-    try { return Number(new URLSearchParams(location.search || "").get("shellT0")) || 0; } catch (e) { return 0; }
-  }
-  var SHELL_T0 = shellT0FromUrl();
 
   // ── 变量表 ───────────────────────────────────────────────────────────
   // seedVars：服务端随页面注入的「首屏变量表」（就是宿主当前的配色）。
@@ -1372,7 +1356,7 @@ const BASE_SHIM = `<script id="hana-base">
       var url = (window.__hanaMount || '') + '/_hana/diag';
       var payload = JSON.stringify(Object.assign({
         kind: kind, href: String(location.href), pathname: String(location.pathname),
-        base: base, readyState: document.readyState, t: Date.now(), shellT0: SHELL_T0
+        base: base, readyState: document.readyState, t: Date.now()
       }, extra || {}));
       var f = window.__hanaOrigFetch;
       if (f) { f.call(window, url, { method: 'POST', body: payload, headers: {'Content-Type':'application/json'}, keepalive: true }).catch(function(){}); return; }
