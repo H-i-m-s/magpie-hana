@@ -333,6 +333,9 @@ export default defineApp(async (sdk) => {
       `magpie 网页：${state.upstreamPort ? `127.0.0.1:${state.upstreamPort}` : "—"}`,
       `网关 3425：${up ? `活着（v${up.version}，${up.models} 个模型）` : "不可达"}`,
       `插件运行时：${plug ? `${plug.bun ? `bun ${plug.bunVersion || "?"}` : "缺 bun（首次装插件会先下载约 90MB）"}${plug.mirror ? "，国内镜像开" : "，国内镜像关"}（已装 ${(plug.plugins || []).length} 个）` : "—"}`,
+      // 只读缓存：卡片首屏那几个接口每次回源要 300~500ms（magpie 自己的开销），
+      // 代理层挡一层后基本是 1~3ms。命中数不清零地長，作废数就是「改过几次设置」。
+      `只读缓存：${proxy?.cache ? `${proxy.cache.entries} 条在缓 / 命中 ${proxy.cache.hit}，过期回源 ${proxy.cache.stale}（后台刷新 ${proxy.cache.refresh}），因写入作废 ${proxy.cache.cleared} 次，首次回源 ${proxy.cache.miss}` : "—"}`,
       `magpie 进程：${state.magpiePid || proxy?.magpiePid || "—"}`,
       `隐藏的功能：${state.hidden.join(", ") || "（无）"}`,
     ];

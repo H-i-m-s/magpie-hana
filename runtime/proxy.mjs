@@ -125,6 +125,8 @@ const state = {
   rewrites: 0,
   magpiePid: null,
   diag: [],              // 诊断：入站原始请求头 + 卡片内部上报的页面上下文
+  cacheStats: { hit: 0, stale: 0, miss: 0, refresh: 0, cleared: 0 },
+  cacheCount: 0,
 };
 
 // HANA_HOME/user/preferences.json 里的 appearance.theme，以及浅/深调色板。
@@ -1511,6 +1513,152 @@ function note(url, status, ct, extra) {
   } catch { /* 忽略 */ }
 }
 
+// ── 只读接口的短 TTL 缓存 ────────────────────────────────────────────────────
+// 为什么要有这一层：magpie 有几个 GET 每次都要重读一遍设置，实测 300~500ms
+// （/api/state 407ms、/api/plugins 512ms、/api/providers 393ms、/api/settings 365ms、
+//  /api/library 1387ms）。卡片首屏要连着打好几个，加起来 1~2 秒，用户看到的就是
+// 「卡片里先转一会儿圈」。最亏的是 /boot.js：只有 81 字节，却写在 <head> 里
+// 阻塞首绘，整页都在等它，而它自己还要 400ms 上下。
+//
+// 做法就是 stale-while-revalidate：命中直接回；过期了也先回旧的，同时在后台刷新。
+// 任何非 GET 请求（改设置、开关供应商、登录、装插件）一到，整张表立刻作废，
+// 而且写之前、写之后各清一次，免得并发中的回源把旧值又填回去。所以自己动手改过的
+// 东西立刻能看到，不会读到旧值。
+//
+// 不确定的部分说清楚：这些接口的内容多久变一次我们并不知道，TTL 是按「变了也
+// 不该超过这几秒才被看到」定的；真正兜住正确性的是「写入即作废」，不是 TTL。
+const CACHED_GETS = new Map([
+  ["/boot.js", 60 * 1000],        // 只在语言/主题/字号变化时变，而那些都走 POST
+  ["/api/settings", 30 * 1000],
+  ["/api/state", 3 * 1000],
+  ["/api/plugins", 3 * 1000],
+  ["/api/providers", 3 * 1000],
+  ["/api/library", 3 * 1000],
+]);
+const CACHE_MAX_BYTES = 8 * 1024 * 1024;
+// 带 ?v=<内容哈希> 的 js/css 改发一年长缓存。想关掉就改成 false。
+const USE_IMMUTABLE_ASSETS = true;
+const getCache = new Map();     // path -> { at, status, headers, body }
+const cacheBusy = new Set();    // 正在后台刷新的 path（同一个只刷一次）
+
+function cachePlanFor(req) {
+  if ((req.method || "GET") !== "GET") return null;
+  const full = servicePath(req.url || "/");
+  const ttl = CACHED_GETS.get(full.split("?")[0]);
+  return ttl ? { key: full, ttl } : null;
+}
+
+function clearGetCache(why) {
+  if (getCache.size === 0) return;
+  getCache.clear();
+  state.cacheCount = 0;
+  state.cacheStats.cleared += 1;
+  if (why) log(`只读缓存已作废（${why}）`);
+}
+
+function serveCached(res, entry, mark) {
+  const headers = { ...entry.headers, "x-hana-cache": mark };
+  headers["content-length"] = String(entry.body.length);
+  delete headers["transfer-encoding"];
+  res.writeHead(entry.status, headers);
+  res.end(entry.body);
+}
+
+// 自己去上游要一份完整的、未压缩的响应。后台刷新与预热都走这条路。
+// 拿不到（非 200、有压缩、太大、断了）就返回 null，缓存保持原样。
+function fetchUpstreamOnce(path) {
+  return new Promise((resolve) => {
+    if (!state.upstreamPort) return resolve(null);
+    const req = httpRequest({
+      host: UPSTREAM_HOST,
+      port: state.upstreamPort,
+      method: "GET",
+      path,
+      headers: {
+        host: `${UPSTREAM_HOST}:${state.upstreamPort}`,
+        cookie: state.upstreamKey ? `magpie_web_${state.upstreamPort}=${state.upstreamKey}` : "",
+        "accept-encoding": "identity",   // 有压缩就不存，见下
+      },
+    }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (c) => {
+        chunks.push(c);
+        size += c.length;
+        if (size > CACHE_MAX_BYTES) { try { res.destroy(); } catch { /* 忽略 */ } }
+      });
+      res.on("error", () => resolve(null));
+      res.on("end", () => {
+        if (res.statusCode !== 200) return resolve(null);
+        // 压缩过的存下来没法安全地发给「没要压缩」的下一个请求，索性不存
+        if (res.headers["content-encoding"]) return resolve(null);
+        if (size > CACHE_MAX_BYTES) return resolve(null);
+        const headers = {};
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (HOP_BY_HOP.has(k.toLowerCase())) continue;
+          headers[k.toLowerCase()] = v;
+        }
+        resolve({ status: 200, headers, body: Buffer.concat(chunks) });
+      });
+    });
+    req.setTimeout(60 * 1000, () => { try { req.destroy(); } catch { /* 忽略 */ } });
+    req.on("error", () => resolve(null));
+    req.end();
+  });
+}
+
+function refreshCached(key) {
+  if (cacheBusy.has(key)) return;
+  cacheBusy.add(key);
+  fetchUpstreamOnce(key).then((fresh) => {
+    cacheBusy.delete(key);
+    if (!fresh) return;
+    getCache.set(key, { at: Date.now(), ...fresh });
+    state.cacheCount = getCache.size;
+    state.cacheStats.refresh += 1;
+  }).catch(() => { cacheBusy.delete(key); });
+}
+
+// 预热：上游刚就绪时先把这几条拉一遍，卡片第一次打开就是热的。
+// 一件一件来（别和首屏抢），失败不影响任何事：请求自己会照常回源。
+async function warmGetCache() {
+  let n = 0;
+  for (const path of CACHED_GETS.keys()) {
+    if (state.phase !== "ready" || state.upstreamPort === 0) return;
+    if (getCache.has(path)) continue;
+    const fresh = await fetchUpstreamOnce(path);
+    if (fresh) {
+      getCache.set(path, { at: Date.now(), ...fresh });
+      state.cacheCount = getCache.size;
+      n += 1;
+    }
+  }
+  if (n > 0) log(`只读缓存预热完成：${n} 条（${[...getCache.keys()].join(", ")}）`);
+}
+
+// 返回 true 表示这个请求已经被缓存层处理掉了，不用再回源
+function handleCachedGet(req, res) {
+  const plan = cachePlanFor(req);
+  if (!plan) return false;
+  const entry = getCache.get(plan.key);
+  if (!entry) {
+    state.cacheStats.miss += 1;
+    refreshCached(plan.key);   // 这次照常回源（慢这一次），顺手把缓存填上
+    return false;
+  }
+  if (Date.now() - entry.at <= plan.ttl) {
+    state.cacheStats.hit += 1;
+    serveCached(res, entry, "hit");
+    note(req.url, entry.status, entry.headers["content-type"] || "", { cache: "hit" });
+  } else {
+    state.cacheStats.stale += 1;
+    serveCached(res, entry, "stale");
+    note(req.url, entry.status, entry.headers["content-type"] || "", { cache: "stale" });
+    refreshCached(plan.key);
+  }
+  return true;
+}
+
 // ── 反代 ─────────────────────────────────────────────────────────────────────
 function proxyRequest(clientReq, clientRes) {
   if (!state.upstreamPort) {
@@ -1578,6 +1726,12 @@ function proxyRequest(clientReq, clientRes) {
       if (!outHeaders["content-type"]) {
         const guess = mimeOf(clientReq.url);
         if (guess) outHeaders["content-type"] = guess;
+      }
+      // 带内容哈希的静态资源（app.css?v=696bc2…）：magpie 只发 no-cache，
+      // 于是浏览器每次打开都要把这十几个文件重新条件请求一遍、校验近 1MB。
+      // 哈希即内容（内容一变哈希就变），所以这里改成一年长缓存是安全的。
+      if (USE_IMMUTABLE_ASSETS && /[?&]v=[0-9a-f]{6,}/i.test(String(clientReq.url || "")) && /\.(?:js|css)$/i.test(String(clientReq.url || "").split("?")[0])) {
+        outHeaders["cache-control"] = "public, max-age=31536000, immutable";
       }
       clientRes.writeHead(upRes.statusCode || 502, outHeaders);
       upRes.pipe(clientRes);
@@ -1710,6 +1864,7 @@ async function handleInternal(req, res) {
       themeApplied: state.themeApplied,
       themeVarsCached: !!(themeCache && themeCache.vars),
       diagCount: state.diag.length,
+      cache: { ...state.cacheStats, entries: state.cacheCount, paths: [...CACHED_GETS.keys()] },
       env: envSnapshot(),
     });
     return true;
@@ -1852,8 +2007,10 @@ async function adoptIfServing(port) {
       state.lastError = null;
       state.upstreamFailures = 0;
       state.respawnCount = 0;
+      clearGetCache("接回重起后的实例");   // 换了进程，旧响应不能再用
       log(`端口 ${port} 已有人在服务（自更新后的重起），接回来，不再重拉`);
       process.stdout.write(`MAGPIE_UPSTREAM_READY port=${port}\n`);
+      warmGetCache();
       return true;
     }
     await new Promise((r) => setTimeout(r, 500));
@@ -1970,12 +2127,14 @@ async function startMagpie({ exe, cwd }) {
       const moved = state.upstreamPort !== 0;
       state.upstreamPort = parseInt(m[1], 10);
       state.upstreamKey = m[2];
+      if (moved) clearGetCache("上游换了一只");   // 自更新重起后是另一个进程
       state.phase = "ready";
       state.lastError = null;
       state.upstreamFailures = 0;
       state.respawnCount = 0;      // 跑起来一只稳定的，计数归零
       log(`${moved ? "上游端口变更" : "上游就绪"}：127.0.0.1:${state.upstreamPort}（key 已取得）`);
       process.stdout.write(`MAGPIE_UPSTREAM_READY port=${state.upstreamPort}\n`);
+      warmGetCache();   // 先把首屏要用的几条填上，卡片第一次打开就是热的
     }
     if (clean.length > 40000) buffer = clean.slice(-8000);
   };
@@ -1997,6 +2156,7 @@ async function startMagpie({ exe, cwd }) {
     }
     const port = state.upstreamPortFixed || state.upstreamPort;
     state.upstreamPort = 0;
+    clearGetCache("上游退出了");
     if (await adoptIfServing(port)) return;   // 是它自己重起的，接回来
     state.phase = "error";
     scheduleRespawn();
@@ -2057,7 +2217,13 @@ function main() {
       return;
     }
     try {
-      proxyRequest(req, res);
+      // 写请求：缓存立刻作废。清两次——写之前一次（免得并发中的读把旧值填回来），
+      // 写之后再一次（这次是真正的失效点）。
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        clearGetCache(req.method + " " + servicePath(req.url || "/"));
+        res.on("close", () => clearGetCache("写入完成"));
+      }
+      if (!handleCachedGet(req, res)) proxyRequest(req, res);
     } catch (e) {
       state.lastError = "转发异常：" + (e && e.message ? e.message : String(e));
       log(state.lastError);
