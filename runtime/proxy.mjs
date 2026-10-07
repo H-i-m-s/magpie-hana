@@ -1534,6 +1534,10 @@ const CACHED_GETS = new Map([
   ["/api/plugins", 3 * 1000],
   ["/api/providers", 3 * 1000],
   ["/api/library", 3 * 1000],
+  // 这两条是「探测本机装了哪些 agent CLI」，每次开页都会打，实测 314~330ms。
+  // 内容只在装了/卸了 agent 时变，而那些动作都走 POST，所以 TTL 可以给长一点。
+  ["/api/agents/cli", 60 * 1000],
+  ["/api/agents/install", 60 * 1000],
 ]);
 const CACHE_MAX_BYTES = 8 * 1024 * 1024;
 // 带 ?v=<内容哈希> 的 js/css 改发一年长缓存。想关掉就改成 false。
@@ -2200,7 +2204,14 @@ function main() {
   log(`Hana 主题（服务端读）：${state.serverTheme || "（未读到）"}`);
 
   server = createServer((req, res) => {
-    if ((req.url || "").startsWith("/_hana/")) {
+    // 宿主把本服务挂在带前缀的路径下，而客户端脚本（我们的探针、主题变量请求）
+    // 也会把前缀拼上，于是 /_hana/xxx 会变成 /api/apps/…/_runtime/…/_hana/xxx。
+    // 早先只认「原样以 /_hana/ 开头」，这些请求就都被当成普通请求转给了上游（404），
+    // 结果是：页面里的诊断探针全是空的，客户端取主题变量的请求也落空。
+    // 所以先按服务内路径归一化再判断。
+    const mountedPath = servicePath(req.url || "/");
+    if (mountedPath.startsWith("/_hana/")) {
+      req.url = mountedPath;
       // 必须自己 .catch：Node 15+ 里未处理的 Promise rejection 默认会让进程
       // 直接退出。内部端点里只要有一处抛出（比如取主题时的 httpRequest 同步抛），
       // 整个代理就会死——而外表看上去只是“某个请求断了”，很难定位。
