@@ -61,22 +61,54 @@
         announceShell();
       })
       .catch(function (e) {
-        show("<b>读不到代理端口</b><br>" + String((e && e.message) || e) + "<br>稍后自动重试…");
+        show("<b>读不到代理端口</b><br>" + String((e && e.message) || e) + "<br>" + scene() + "<br>稍后自动重试…");
         setTimeout(connect, Math.min(1500 * tries, 6000));
       });
   }
 
   // 读 App 路由的 /status。为什么不能裸 fetch：路由端要求凭据，裸 fetch 带不上，
-  // 会静默 403（设置页那边踩过同样的坑）。载荷里 route 相对于 App 的 routes 根。
+  // 会静默 403（设置页那边踩过同样的坑）。而 route 卡片文档里并没有注入 Hana SDK
+  // （实测 window.hana 不存在），所以凭据得自己找：服务卡片的做法是从卡片 URL 的
+  // 查询串里取 appSurfaceSession，再用 X-Hana-App-Surface-Session 头带上。
+  // 这里做成阶梯：SDK → 带凭据头的请求 → 裸请求 → 把现场细节显示出来。
+  function sessionFromUrl() {
+    var keys = ["appSurfaceSession", "surfaceSession", "hanaSession", "session", "ticket"];
+    for (var i = 0; i < keys.length; i++) {
+      try {
+        var v = new URLSearchParams(location.search || "").get(keys[i]);
+        if (v && v.length >= 8) return { key: keys[i], value: v };
+      } catch (_) {}
+    }
+    return null;
+  }
+
   function readStatus() {
     var sdk = window.hana && window.hana.api && window.hana.api.fetch;
     if (sdk) {
       return Promise.resolve(window.hana.api.fetch("/magpie-hana/status")).then(function (r) { return r.json(); });
     }
-    return fetch(ABS + "/status", { credentials: "same-origin" }).then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status + "（没有 Hana SDK，裸 fetch 拿不到凭据）");
-      return r.json();
-    });
+    var s = sessionFromUrl();
+    function attempt(withSession) {
+      var headers = withSession ? { "X-Hana-App-Surface-Session": s.value } : {};
+      return fetch(ABS + "/status", { credentials: "same-origin", headers: headers }).then(function (r) {
+        if (r.ok) return r.json();
+        var err = new Error("HTTP " + r.status + (withSession ? "（已带上 " + s.key + "）" : "（没找到凭据参数）"));
+        err.status = r.status;
+        throw err;
+      });
+    }
+    if (s) return attempt(true).catch(function () { return attempt(false); });
+    return attempt(false);
+  }
+
+  // 失败现场：不猜，直接告诉上游到底有什么。
+  function scene() {
+    var globals = [];
+    try {
+      globals = Object.keys(window).filter(function (k) { return /hana|sdk|app|surface|card/i.test(k); }).slice(0, 12);
+    } catch (_) {}
+    return "查询串：" + String(location.search || "（空）").slice(0, 160) +
+      "<br>候选全局：" + (globals.length ? globals.join(", ") : "（无）");
   }
 
   function announceShell() {
