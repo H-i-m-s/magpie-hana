@@ -107,8 +107,11 @@ export default defineApp(async (sdk) => {
         `请重新安装本 App，或把 magpie-windows-amd64.exe 放到 App 目录的 vendor/ 下。`);
     }
     mkdirSync(binDir, { recursive: true });
-    // 先拷到临时名，再落定；全程不碰已存在的目标
-    const tmp = exePath + ".new";
+    // 先拷到临时名，再落定；全程不碰已存在的目标。
+    // 临时名刻意避开 ".new"："magpie.exe.new" 是 magpie 自己的待安装包
+    // （internal/update 的 StageBinary 就用这个名）。播种时机若恰好在它换名
+    // 安装的那一瞬间（exe 暂时不在），用 .new 会把人家下好的新版覆盖掉。
+    const tmp = exePath + ".hana-seed";
     if (existsSync(tmp)) { try { rmSync(tmp, { force: true }); } catch { /* 忽略 */ } }
     copyFileSync(vendor, tmp);
     if (existsSync(exePath)) {  // 并发播种：别人先落了，放弃自己的那份
@@ -322,11 +325,14 @@ export default defineApp(async (sdk) => {
     const up = await gatewayUp();
     let proxy = null;
     try { if (state.proxyPort) proxy = await proxyJson("/_hana/status"); } catch { /* 忽略 */ }
+    let plug = null;
+    try { plug = await proxyJson("/api/plugins"); } catch { /* 忽略 */ }
     const lines = [
       `托管的 magpie：${state.phase}`,
       `代理端口：${state.proxyPort || "—"}`,
       `magpie 网页：${state.upstreamPort ? `127.0.0.1:${state.upstreamPort}` : "—"}`,
       `网关 3425：${up ? `活着（v${up.version}，${up.models} 个模型）` : "不可达"}`,
+      `插件运行时：${plug ? `${plug.bun ? `bun ${plug.bunVersion || "?"}` : "缺 bun（首次装插件会先下载约 90MB）"}${plug.mirror ? "，国内镜像开" : "，国内镜像关"}（已装 ${(plug.plugins || []).length} 个）` : "—"}`,
       `magpie 进程：${state.magpiePid || proxy?.magpiePid || "—"}`,
       `隐藏的功能：${state.hidden.join(", ") || "（无）"}`,
     ];
@@ -505,12 +511,25 @@ export default defineApp(async (sdk) => {
       app.get("/magpie-hana/status", async (c) => {
         try {
           const up = await gatewayUp();
+          // 上游端口/pid 以代理的实时值为准：启动时记的那份在自更新重起后会过期，
+          // 而运行状态页面不该给人看一个过期的端口。代理问不到就退回本地那份。
+          let live = null;
+          try { if (state.proxyPort) live = await proxyJson("/_hana/status"); } catch { /* 忽略 */ }
+          // 插件运行时也报一下：bun 不在时第一次装插件会先去下 90MB，
+          // 而国内网络下得靠「国内镜像」开关，这两件都该在运行状态里看得见。
+          let plug = null;
+          try { plug = await proxyJson("/api/plugins"); } catch { /* 忽略 */ }
           return c.json({
             ok: true, app: { id: APP_ID, version: APP_VERSION },
-            phase: state.phase, proxyPort: state.proxyPort, upstreamPort: state.upstreamPort,
-            magpiePid: state.magpiePid, magpieVersion: state.magpieVersion,
+            phase: state.phase, proxyPort: state.proxyPort,
+            upstreamPort: live?.upstreamPort || state.upstreamPort,
+            magpiePid: live?.magpiePid || state.magpiePid, magpieVersion: state.magpieVersion,
             lastError: state.lastError, hidden: state.hidden, theme: state.themeChoice,
             gateway: up ? { ok: true, version: up.version, models: up.models } : { ok: false },
+            plugins: plug ? {
+              bun: !!plug.bun, bunVersion: plug.bunVersion || "",
+              mirror: !!plug.mirror, count: (plug.plugins || []).length,
+            } : null,
           });
         } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
       });

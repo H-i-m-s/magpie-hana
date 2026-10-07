@@ -195,7 +195,7 @@
     <div class="row">
       <div class="who">
         <div class="name">主题</div>
-        <div class="desc">自动 = 跟随 Hana 当前主题，你在 Hana 里换，卡片里 5 秒内跟上。也可以让 magpie 固定用某一套 Hana 主题。<br>magpie 自己设置页里的「外观（跟随系统 / 浅色 / 深色）」仍然可用，会自动对应到 Hana 的浅色/深色主题。</div>
+        <div class="desc">自动 = 跟随 Hana 当前主题，你在 Hana 里换，卡片里 5 秒内跟上。也可以钉住某一套 Hana 主题。<br>卡片里那个「外观」下拉与本清单逐项一致（同一个存储），改哪边另一边都会跟上。</div>
       </div>
       <div class="hs" id="themeHs">
         <button class="hs-trigger" id="themeTrigger" type="button" aria-haspopup="listbox" aria-expanded="false">
@@ -369,12 +369,17 @@
       function openPanel() {
         panel.hidden = false;
         place();
-        // 先定位再上类，保证过渡从正确位置展开
-        requestAnimationFrame(() => {
+        // 先定位再上类，保证过渡从正确位置展开。
+        // rAF 在隐藏/后台的窗口里不触发（实测 visibilityState=hidden 时不跑），
+        // 补一个定时器兜底，免得面板只是 hidden=false 却永远不显形。两者幂等。
+        const reveal = () => {
+          if (!open) return;
           panel.classList.add('open');
           root.classList.add('open');
           trigger.setAttribute('aria-expanded', 'true');
-        });
+        };
+        requestAnimationFrame(reveal);
+        setTimeout(reveal, 60);
         open = true;
       }
       function close() {
@@ -393,8 +398,15 @@
         else if (e.key === 'Escape') close();
       });
       document.addEventListener('click', close);
-      // 页面滚动 / 尺寸变化时面板会跟丢，直接关掉最稳
-      window.addEventListener('scroll', close, true);
+      // 页面滚动 / 尺寸变化时面板会跟丢，直接关掉最稳。
+      // 例外：面板自己滚（选项多、面板有 max-height）不算页面动了 ——
+      // 不带这个判断，滚轮一进面板就把它收掉，看着就是「一滚动菜单就消失」。
+      // scroll 不冒泡，但捕获阶段照样经过 window，所以要在捕获里放过面板内部。
+      window.addEventListener('scroll', (e) => {
+        const t = e.target;
+        if (t === panel || (t && t.nodeType === 1 && panel.contains(t))) return;
+        close();
+      }, true);
       window.addEventListener('resize', close);
       document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 
@@ -484,11 +496,19 @@
         hidden = Array.isArray(st.hidden) ? st.hidden : [];
         const map = { ready: '运行中', starting: '启动中', idle: '已停止', error: '出错', disabled: '已停用' };
         document.getElementById('phaseDesc').textContent = map[st.phase] || st.phase;
+        const p = st.plugins;
+        // bun 缺失时要说清会自己下（不是要人去搬），并指一下国内镜像那条路：
+        // 官方源在墙外，开关不打开时第一次装插件会先卡到超时。
+        const plugText = p
+          ? `插件 ${p.bun ? 'bun ' + (p.bunVersion || '?') : '缺 bun（首次装插件它会自己下约 90MB）'}` +
+            ` · 国内镜像${p.mirror ? '开' : '关'} · 已装 ${p.count} 个`
+          : null;
         document.getElementById('kv').textContent = [
           `代理端口 ${st.proxyPort || '—'}`,
           `magpie 网页 ${st.upstreamPort ? '127.0.0.1:' + st.upstreamPort : '—'}`,
           `网关 3425 ${st.gateway && st.gateway.ok ? '活着（v' + st.gateway.version + '，' + st.gateway.models + ' 个模型）' : '不可达'}`,
-        ].join(' · ');
+          plugText,
+        ].filter(Boolean).join(' · ');
         document.getElementById('status').textContent = st.lastError ? '最近错误：' + st.lastError : '';
         if (st.theme) {
           themeSel.value = st.theme;

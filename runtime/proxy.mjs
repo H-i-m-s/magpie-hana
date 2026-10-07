@@ -21,6 +21,35 @@ import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { userInfo } from "node:os";
+import { connect } from "node:net";
+import { randomBytes } from "node:crypto";
+// 托管进程的环境快照。
+//
+// 为什么要这个：magpie 靠「用户目录 + 各家 agent 的配置文件」判断本机装了哪些 agent。
+// 同一个 exe，在普通 shell 里能认出 9 个，在宿主给的环境里只认出一个（实测），
+// 差别只能在环境。这里把相关变量摆出来（白名单，不吐整份 env，里面可能有凭据）。
+function envSnapshot() {
+  const keys = [
+    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+    "HOME", "XDG_CONFIG_HOME", "SystemRoot", "ComSpec",
+  ];
+  const out = {
+    pid: process.pid,
+    cwd: process.cwd(),
+    user: (() => { try { return userInfo().username; } catch { return ""; } })(),
+  };
+  for (const k of keys) {
+    const v = process.env[k];
+    out[k] = v === undefined ? "(未设置)" : v;
+  }
+  const p = process.env.PATH || process.env.Path || "";
+  out.PATH_dirs = p.split(";").filter(Boolean).length;
+  out.PATH_head = p.slice(0, 200);
+  out.ENV_count = Object.keys(process.env).length;
+  return out;
+}
+
 const UPSTREAM_HOST = "127.0.0.1";
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const HOP_BY_HOP = new Set([
@@ -78,6 +107,12 @@ const state = {
   upstreamPort: 0,
   recent: [],          // 最近请求（诊断：看卡片实际发的是什么路径）
   upstreamKey: "",
+  upstreamFailures: 0,   // 连续多少次连不上上游（到了阈值就自愈重拉）
+  exePath: "",          // 当前被托管的 exe（重拉时要用）
+  exeCwd: "",
+  respawnCount: 0,
+  upstreamPortFixed: 0,  // 钉给 magpie 的 web 端口：自更新重起时会延用同一个
+  webKey: "",            // 固定的网页 key：重起后也认得出同一只
   hidden: new Set(DEFAULT_HIDDEN),
   themeAttr: "",
   themeChoice: "auto",   // 主题设置：auto | 具体主题名（青夜/暖纸/…）
@@ -242,6 +277,10 @@ const THEME_CLIENT = `<script id="hana-theme-client">
   // cache：主题名 -> 变量表。按需从宿主 / 代理取，取到就留着。
   var cache = {};
   var seedVars = (window.__hanaVars && typeof window.__hanaVars === "object") ? window.__hanaVars : null;
+  // seedName：首屏那张变量表到底是哪一套主题的（服务端解析出来时就知道）。
+  // 早先只判断了 P.theme，而实测卡片 iframe 与直接访问代理时 P.theme 都可能是
+  // 空串 —— 那句 !P.theme 于是对所有主题名前都成立，选任何主题都拿回首屏那张表。
+  var seedName = (typeof window.__hanaSeedName === "string") ? window.__hanaSeedName : "";
 
   function parseVars(css){
     var out = {}, re = /(--[A-Za-z0-9_-]+)\\s*:\\s*([^;}]+)/g, m;
@@ -265,7 +304,7 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     if (cache[name]) return Promise.resolve(cache[name]);
     // 首屏：如果请求的正是宿主当前主题，而服务端也备好了种子，直接用。
     // （直接访问代理时没有 URL 参数，P.theme 为空，此时也会落到这里。）
-    if (seedVars && usable(seedVars) && (!P.theme || name === P.theme)) {
+    if (seedVars && usable(seedVars) && seedName && name === seedName) {
       cache[name] = seedVars;
       return Promise.resolve(seedVars);
     }
@@ -368,6 +407,9 @@ const THEME_CLIENT = `<script id="hana-theme-client">
       (document.head || document.documentElement).appendChild(el);
     }
     if (el.textContent !== built.css) el.textContent = built.css;
+    // 告诉同页的其它注入脚本（外观下拉）：配色刚换过，该重新对一下标签。
+    // 为什么不能只靠 DOM 观察：上色用的是 <head> 里那个 <style>，不在 body 子树上。
+    try { window.dispatchEvent(new Event("hana-theme-applied")); } catch (e) {}
     // 注意：这里【不碰】 document.documentElement 的 data-theme。
     // 那是 magpie 自己的「外观」开关（system/light/dark）的地盘，
     // 抢过来写就等于把它的设置项焊死。我们只读它，见 render() 里的选取逻辑。
@@ -397,7 +439,7 @@ const THEME_CLIENT = `<script id="hana-theme-client">
         appliedKey = choice + "|" + dataThemeAttr();
       });
     }
-    var host = hostName || P.theme || "";
+    var host = hostName || P.theme || (choice === "auto" ? seedName : "") || "";
     if (!host) return Promise.resolve();
     return varsFor(host).then(function(v){
       if (!v) return;
@@ -419,6 +461,15 @@ const THEME_CLIENT = `<script id="hana-theme-client">
       });
     });
   }
+
+  // 给同一页里的其它注入脚本（卡片里的「外观」下拉）一个入口：
+  // 换完主题选择就地重画，不用等下面那个 5 秒轮询。
+  window.__hanaThemeApply = function(next){
+    if (typeof next === "string" && next) window.__hanaThemeChoice = next;
+    appliedKey = "";
+    followNow = true;
+    return render();
+  };
 
   // 判一套配色变量的明暗（用来和 magpie 自己的 data-theme 比对）。
   // 放在 render 之前定义；早先这次清理误删过它，导致 render 里抛
@@ -474,10 +525,20 @@ const THEME_CLIENT = `<script id="hana-theme-client">
         if (!j || !j.theme) return;
         if (j.light) P.light = j.light;
         if (j.dark) P.dark = j.dark;
+        // 主题选择（设置页的主题下拉 / 卡片里的「外观」下拉）变了：
+        // 把它当一次显式选择，把跟随拿回来并强制重算。
+        // 没这一段的话，已打开的页面会一直用挂载当刻的旧选择。
+        var choiceChanged = false;
+        if (typeof j.choice === "string" && j.choice && j.choice !== window.__hanaThemeChoice) {
+          window.__hanaThemeChoice = j.choice;
+          appliedKey = "";
+          followNow = true;
+          choiceChanged = true;
+        }
         // 只跟 hostName 比。不能把 P.theme 也当“当前值”：P.theme 是挂载当刻
         // 的 URL 快照，拿它比会让首次轮询就把 hostName 定死，之后 A→B→A
         // 这种来回切换永远回不去。
-        if (j.theme === hostName) return;
+        if (j.theme === hostName && !choiceChanged) return;
         hostName = j.theme;
         // Hana 那边换了主题：重新把「跟随」拿回来，并强制重算。
         // （用户在 magpie 里点过外观的话，followNow 已被置 false；
@@ -546,6 +607,430 @@ const THEME_CLIENT = `<script id="hana-theme-client">
     setTimeout(run, 700);
     setTimeout(run, 2200);
   })();
+})();
+</script>
+`;
+
+// ── 外观下拉：把 magpie 设置页的分段控件换成一枚自绘下拉 ──────────────────
+//
+// 目标 DOM（magpie 自己的 index.html，设置 → 常规）：
+//   <div class="row pref">
+//     <div class="who">…外观 / 浅色、深色，或跟随系统…</div>
+//     <div id="themeSegs" class="om-hide"></div>
+//   </div>
+// app.js 会把 #themeSegs 填成一个 .segs 盒子（dataset.kind = "system|light|dark"），
+// 里面三个 button.opt，点谁谁带 .on。
+//
+// 做法：先把 #themeSegs 收起来（它此刻还是空的，所以没有闪动），在旁边插入自己
+// 的下拉；选项就直接用注入的 THEME_OPTIONS（与设置页同一份清单）。
+// 选中一项 = 写「主题选择」（App 的 ui.json 是唯一写者），本页立刻重画；
+// 原生控件仍然留着（只藏不删），magpie 自己的存取路径不受影响。
+// 万一本段脚本没跑通，3.6 秒后把原生控件放回来。
+const SELECT_CLIENT = `<script id="hana-select-client">
+(function(){
+  var ROOT = document.documentElement;
+  var NATIVE_ID = "themeSegs";
+  var HOST_ID = "hanaThemeSelect";
+  // 值就是「主题选择」本身：auto 或某个 Hana 主题名。
+  // 服务端拿不到时的兜底（与 proxy.mjs 里的 THEME_OPTIONS 同一份）
+  var FALLBACK = [
+    ["auto", "自动（跟随 Hana）"],
+    ["midnight", "青夜"], ["midnight-contrast", "青夜 · 高对比"],
+    ["warm-paper", "暖纸"], ["new-warm-paper", "新暖纸"], ["high-contrast", "素白"],
+    ["grass-aroma", "草香"], ["contemplation", "沉思"], ["absolutely", "Absolutely"],
+    ["delve", "Delve"], ["deep-think", "Deep Think"], ["coral", "珊瑚"]
+  ];
+  // 与 BASE_SHIM / THEME_CLIENT 同一套算法：卡片挂载前缀，直接访问代理时为空串。
+  var BASE = (function(){
+    var p = location.pathname || "/";
+    if (p === "/") return "";
+    return p.charAt(p.length - 1) === "/" ? p.slice(0, -1) : p;
+  })();
+
+  // 立刻收起原生分段控件。此刻它还没被 app.js 填内容，所以不闪；
+  // 构建失败时（见 ensure 的兜底）会把类摘掉，原生控件原样回来。
+  try { ROOT.classList.add("hana-theme-select"); } catch (e) {}
+
+  var state = { opts: [], ids: [], optEls: [], label: null, panel: null, open: false, built: false };
+
+  function report(kind, extra) {
+    try { if (typeof window.__hanaDiag === "function") window.__hanaDiag(kind, extra || {}); } catch (e) {}
+  }
+  function nativeBox() { return document.getElementById(NATIVE_ID); }
+  function trim(s) { return String(s == null ? "" : s).replace(/^\\s+|\\s+$/g, ""); }
+
+  // 选项表：来自服务端注入的 THEME_OPTIONS（window.__hanaThemeList）；
+  // 拿不到时用内置的那份。分隔线放在第 1 项之后（自动 / 具体主题 之间），
+  // 与设置页里的位置一致。
+  function themeOptions() {
+    var list = (window.__hanaThemeList && window.__hanaThemeList.length) ? window.__hanaThemeList : FALLBACK;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var id = String((list[i] && list[i][0]) || "");
+      if (!id) continue;
+      out.push({ id: id, label: String((list[i] && list[i][1]) || id), sepBefore: out.length === 1 });
+    }
+    return out;
+  }
+
+  // 当前值就是「主题选择」本身（跟着代理走，5 秒轮询保持最新）。
+  // 早先这里还去读 magpie 原生控件的明暗，于是下拉里多出「浅色 / 深色」——
+  // 它们只是把明暗叠在「跟随 Hana」上，点了看不出变化，也与设置页清单对不上。
+  // 现在选择只有一个来源。
+  function currentId() {
+    var choice = "";
+    try { choice = String(window.__hanaThemeChoice || ""); } catch (e) {}
+    return choice || "auto";
+  }
+
+  // 那一行的说明文字是 magpie 自己的 i18n 串（「浅色、深色，或跟随系统」），
+  // 它描述的是原生的三档；下拉换成 Hana 主题清单后这句就对不上了，改成同义的一句。
+  //
+  // 不能记「已改过」标记就完事：magpie 换语言/重绘时会按自己的 data-t/data-en
+  // 把文字写回去，而标记还留着 —— 实测就撞上了（它自更新到 0.1.973 之后那片描述又变回去了）。
+  // 现在改成比文字：不一样就再改一遍，一样就不动（不会自激）。同时看着那一格的子树，
+  // 它被改回去就能当场纠回来。元素叫 .sub（不是 .desc），一份普通、一份 om-only（Omarchy 下才显示）。
+  var ROW_DESC = "跟随 Hana 当前主题，或钉住某一套 Hana 主题（与插件设置里的「主题」同一份）";
+  function fixRowDesc() {
+    var box = nativeBox();
+    if (!box) return;
+    try {
+      var row = box.closest ? box.closest(".row") : null;
+      if (!row) return;
+      var subs = row.querySelectorAll(".sub");
+      for (var i = 0; i < subs.length; i++) {
+        if (subs[i].textContent === ROW_DESC) continue;
+        subs[i].textContent = ROW_DESC;
+      }
+      watchRowDesc(row);
+    } catch (e) {}
+  }
+  function watchRowDesc(row) {
+    var who = row.querySelector(".who");
+    if (!who || who.__hanaDescWatched || !window.MutationObserver) return;
+    who.__hanaDescWatched = true;
+    new MutationObserver(function(){ fixRowDesc(); })
+      .observe(who, { childList: true, characterData: true, subtree: true });
+  }
+
+  function refresh() {
+    var v = currentId();
+    for (var i = 0; i < state.optEls.length; i++) {
+      var el = state.optEls[i];
+      var on = el.dataset.value === v;
+      if (on) el.classList.add("selected"); else el.classList.remove("selected");
+      el.setAttribute("aria-selected", on ? "true" : "false");
+    }
+    if (state.label) {
+      var text = "";
+      for (var k = 0; k < state.opts.length; k++) if (state.opts[k].id === v) text = state.opts[k].label;
+      state.label.textContent = text || (state.opts[0] ? state.opts[0].label : "");
+    }
+  }
+
+  function openPanel() {
+    var p = state.panel, host = document.getElementById(HOST_ID);
+    if (!p || !host) return;
+    var tr = host.getBoundingClientRect();
+    var vh = window.innerHeight || document.documentElement.clientHeight || 480;
+    var vw = window.innerWidth || document.documentElement.clientWidth || 320;
+    var gap = 4, pad = 8;
+    p.hidden = false;
+    p.style.minWidth = Math.max(140, Math.round(tr.width)) + "px";
+    p.style.left = Math.round(tr.left) + "px";
+    p.style.top = Math.round(tr.bottom + gap) + "px";
+    p.style.maxHeight = "240px";
+    var ph = p.offsetHeight;
+    // 下方空间不够就翻到触发器上面；连上面也放不下就贴着下沿、滚着看
+    if (tr.bottom + gap + ph > vh - pad) {
+      var above = tr.top - gap - ph;
+      if (above >= pad) p.style.top = Math.round(above) + "px";
+      else {
+        p.style.maxHeight = Math.max(96, Math.round(vh - tr.bottom - pad - gap)) + "px";
+        p.style.top = Math.round(tr.bottom + gap) + "px";
+      }
+    }
+    var pw = p.offsetWidth;
+    // 贴著右缘时改成右对齐：否则比触发器宽的面板会鼓到卡片外面去
+    if (tr.right > vw * 0.55) p.style.left = Math.max(pad, Math.round(tr.right - pw)) + "px";
+    var left = parseFloat(p.style.left) || 0;
+    if (left + pw > vw - pad) p.style.left = Math.max(pad, Math.round(vw - pw - pad)) + "px";
+    state.open = true;
+    // 面板的「打开」体现在 .open 上：先定位、下一帧再上类，过渡才从正确位置展开。
+    // rAF 在隐藏/后台的窗口里不触发（实测 visibilityState=hidden 时不跑），
+    // 补一个定时器兜底，否则面板只是 hidden=false 却永远不显形。两边都是幂等的。
+    var reveal = function(){
+      if (!state.open) return;
+      p.classList.add("open");
+      host.classList.add("open");
+      host.setAttribute("aria-expanded", "true");
+    };
+    requestAnimationFrame(reveal);
+    setTimeout(reveal, 60);
+  }
+
+  function closePanel() {
+    if (!state.open) return;
+    state.open = false;
+    var p = state.panel, host = document.getElementById(HOST_ID);
+    if (p) p.classList.remove("open");
+    if (host) { host.classList.remove("open"); host.setAttribute("aria-expanded", "false"); }
+    setTimeout(function(){ if (!state.open && p) p.hidden = true; }, 140);
+  }
+
+  // 选择落地：写进 App 的 ui.json（它才是唯一写者，写完再推给代理进程），
+  // 然后让本页立刻按新选择重画，不等那 5 秒轮询。
+  //
+  // 为什么要绕 App 的 routes 而不是直接 POST 代理的 /_hana/theme：
+  // 代理那份只是内存，重启就丢；设置页读写的也是 App 的那份。两边必须同源。
+  // 凭据靠卡片 iframe URL 上的 appSurfaceSession（与设置页 SDK 用的是同一个）。
+  // 直接打开代理页（没有会话）时退回代理自己的端点，功能照旧，只是不落盘。
+  function choiceUrl() { return location.origin + "/api/apps/magpie-hana/routes/magpie-hana/theme"; }
+  // 凭据：宿主给卡片的 appSurfaceSession。设置页的 SDK 是从 iframe URL 的查询串里
+  // 取它的；卡片自己那个 URL 里票据也可能在路径上（…/_surface/<ticket>/…）。
+  // 两条都试，拿不到就用代理端点兜底（直接打开代理页就是这种情况）。
+  function surfaceSession() {
+    var s = "";
+    try { s = new URLSearchParams(location.search || "").get("appSurfaceSession") || ""; } catch (e) {}
+    if (s) return s;
+    // 卡片自己那个 URL 里票据在路径上（…/_surface/<ticket>/…）。不用正则：
+    // 这层模板串会把 \/ 这类转义吃掉一层，写 indexOf 最稳。
+    try {
+      var p = String(location.pathname || "");
+      var at = p.indexOf("/_surface/");
+      if (at >= 0) {
+        var rest = p.slice(at + 10);
+        var cut = rest.indexOf("/");
+        s = decodeURIComponent(cut >= 0 ? rest.slice(0, cut) : rest);
+      }
+    } catch (e) {}
+    return s;
+  }
+  function postChoice(id) {
+    var session = surfaceSession();
+    if (!session) {
+      report("theme-choice-post", { via: "proxy", theme: id, reason: "no-session" });
+      proxyPostChoice(id);
+      return;
+    }
+    try {
+      fetch(choiceUrl(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Hana-App-Surface-Session": session },
+        body: JSON.stringify({ theme: id })
+      }).then(function(r){
+        if (r && r.ok) { report("theme-choice-post", { via: "surface", theme: id, status: r.status }); return; }
+        report("theme-choice-post", { via: "proxy", theme: id, status: r ? r.status : 0 });
+        proxyPostChoice(id);
+      }).catch(function(e){
+        report("theme-choice-post", { via: "proxy", theme: id, reason: String((e && e.message) || e) });
+        proxyPostChoice(id);
+      });
+    } catch (e) { proxyPostChoice(id); }
+  }
+  function proxyPostChoice(id) {
+    try {
+      fetch(BASE + "/_hana/theme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ theme: id })
+      }).catch(function(){});
+    } catch (e) {}
+  }
+  function applyChoice(id) {
+    postChoice(id);
+    try {
+      if (typeof window.__hanaThemeApply === "function") window.__hanaThemeApply(id);
+      else window.__hanaThemeChoice = id;
+    } catch (e) {}
+  }
+
+  function pick(id) {
+    // 每一项都直接落到「主题选择」上（App 的 ui.json 是唯一写者），
+    // 本页自己立刻重画，不等那 5 秒轮询。
+    applyChoice(id);
+    closePanel();
+    refresh();
+  }
+
+  function buildPanel(opts) {
+    var p = state.panel;
+    if (!p) {
+      p = document.createElement("div");
+      p.className = "hana-select-panel";
+      p.setAttribute("role", "listbox");
+      p.hidden = true;
+      document.body.appendChild(p);
+      state.panel = p;
+      document.addEventListener("click", function(){ closePanel(); });
+      document.addEventListener("keydown", function(e){ if (e.key === "Escape") closePanel(); });
+      // 面板自己滚（选项多、卡片矮，这里必然要滚）不算「页面动了」。
+      // 早先这条不带判断，滚轮一进面板就把它收掉，现象就是「一滚动菜单就消失」。
+      // scroll 不冒泡，但捕获阶段照样经过 window，所以必须在捕获里放过面板内部。
+      window.addEventListener("scroll", function(e){
+        var t = e && e.target;
+        if (t && state.panel && (t === state.panel || (t.nodeType === 1 && state.panel.contains(t)))) return;
+        closePanel();
+      }, true);
+      window.addEventListener("resize", function(){ closePanel(); });
+    }
+    p.innerHTML = "";
+    state.optEls = [];
+    for (var i = 0; i < opts.length; i++) {
+      if (opts[i].sepBefore) {
+        var sep = document.createElement("div");
+        sep.className = "hana-select-sep";
+        p.appendChild(sep);
+      }
+      var el = document.createElement("div");
+      el.className = "hana-select-option";
+      el.setAttribute("role", "option");
+      el.dataset.value = opts[i].id;
+      el.textContent = opts[i].label;
+      (function(opt){
+        el.addEventListener("click", function(e){ e.stopPropagation(); pick(opt.id); });
+      })(opts[i]);
+      p.appendChild(el);
+      state.optEls.push(el);
+    }
+  }
+
+  function build() {
+    var opts = themeOptions();
+    if (!opts || !opts.length) return false;
+    var box = nativeBox();
+    if (!box || !box.parentNode) return false;
+    state.opts = opts;
+    state.ids = [];
+    for (var i = 0; i < opts.length; i++) state.ids.push(opts[i].id);
+
+    var host = document.getElementById(HOST_ID);
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HOST_ID;
+      host.className = "hana-select";
+      host.setAttribute("role", "button");
+      host.setAttribute("tabindex", "0");
+      host.setAttribute("aria-haspopup", "listbox");
+      host.setAttribute("aria-expanded", "false");
+      var span = document.createElement("span");
+      span.className = "hana-select-label";
+      var chev = document.createElement("span");
+      chev.className = "hana-select-chevron";
+      chev.setAttribute("aria-hidden", "true");
+      host.appendChild(span);
+      host.appendChild(chev);
+      state.label = span;
+      // 无障碍名：借同一行「外观 / Appearance」那行标题，别让读屏器念一个空按钮
+      var rowName = "";
+      try {
+        var icon = box.closest ? box.closest(".row") : null;
+        var nm = icon ? icon.querySelector(".name") : null;
+        rowName = nm ? trim(nm.textContent) : "";
+      } catch (e) {}
+      host.setAttribute("aria-label", rowName || "外观");
+      host.addEventListener("click", function(e){
+        e.stopPropagation();
+        if (state.open) closePanel(); else openPanel();
+      });
+      host.addEventListener("keydown", function(e){
+        var k = e.key;
+        if (k === "Enter" || k === " " || k === "Spacebar") {
+          e.preventDefault();
+          if (state.open) closePanel(); else openPanel();
+        } else if (k === "Escape") { closePanel(); }
+      });
+    }
+    // 紧跟在原生控件后面（同一行的右侧那一格）
+    if (host.parentNode !== box.parentNode) box.parentNode.insertBefore(host, box.nextSibling);
+    // 确认建出来了才收起原生控件（先前若因建不出来而放回过，这里再收起来）
+    try { ROOT.classList.add("hana-theme-select"); } catch (e) {}
+
+    buildPanel(opts);
+    fixRowDesc();
+    state.built = true;
+    refresh();
+    watchNative();
+    report("theme-select-ready", {
+      options: state.ids.join("|"),
+      labels: state.opts.map(function(o){ return o.label; }).join("|")
+    });
+    return true;
+  }
+
+  // 原生控件被重绘（app.js 每次重画都 replaceChildren）时同步选中态
+  function watchNative() {
+    var box = nativeBox();
+    if (!box || box.__hanaSelectWatched || !window.MutationObserver) return;
+    box.__hanaSelectWatched = true;
+    new MutationObserver(function(){ refresh(); fixRowDesc(); })
+      .observe(box, { childList: true, subtree: true, attributes: true, attributeFilter: ["class"] });
+  }
+
+  var boot = 0, lastTry = 0, warned = false, retryTimer = null;
+  function ensure() {
+    if (state.built && document.getElementById(HOST_ID)) return true;
+    // 防抖：DOM 一抖就重试会把主线程拖住，而建不出来的原因往往同一刻也不会变。
+    // 被防抖挡掉的那次排一个尾随重试，免得错过刚出现的窗口。
+    var now = Date.now();
+    if (now - lastTry < 300) {
+      if (!retryTimer) {
+        retryTimer = setTimeout(function(){ retryTimer = null; ensure(); }, 320 - (now - lastTry));
+      }
+      return false;
+    }
+    retryTimer = null;
+    lastTry = now;
+    if (build()) return true;
+    boot += 1;
+    // 试了很多次都没成，先把原生控件放回来（别把设置弄丢），但不就此死心：
+    // 设置页可能在很久之后才被打开，那时才轮到控件出现。
+    if (boot >= 25 && !warned) {
+      warned = true;
+      try { ROOT.classList.remove("hana-theme-select"); } catch (e) {}
+      report("theme-select-waiting", { tries: boot });
+    }
+    return false;
+  }
+
+  // magpie 自己改 data-theme 时同步（原生按钮也走这条）
+  try {
+    if (window.MutationObserver) {
+      new MutationObserver(function(){ refresh(); })
+        .observe(ROOT, { attributes: true, attributeFilter: ["data-theme"] });
+    }
+  } catch (e) {}
+
+  // 页面配色换过（自己选的、设置页改的、Hana 换主题都算）就重新对标签
+  try { window.addEventListener("hana-theme-applied", function(){ refresh(); }); } catch (e) {}
+
+  // 设置页若被重建，把下拉补回去
+  try {
+    if (window.MutationObserver) {
+      var pending = false;
+      new MutationObserver(function(){
+        if (pending) return;
+        pending = true;
+        setTimeout(function(){
+          pending = false;
+          if (!state.built || !document.getElementById(HOST_ID)) { state.built = false; ensure(); }
+          else { refresh(); watchNative(); }
+        }, 60);
+      }).observe(document.body, { childList: true, subtree: true });
+    }
+  } catch (e) {}
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ensure);
+  ensure();
+  setTimeout(ensure, 1200);
+  setTimeout(ensure, 3000);
+  // 安全网：即便没等到 DOM 变更（magpie 在某些路径上是直接换子节点，理论上有，
+  // 但不想把“能不能出来”压在一个观察器上），前两分钟每 2.5 秒也看一眼
+  var tick = setInterval(function(){
+    if (state.built && document.getElementById(HOST_ID)) { clearInterval(tick); return; }
+    ensure();
+  }, 2500);
+  setTimeout(function(){ clearInterval(tick); }, 120000);
 })();
 </script>
 `;
@@ -653,6 +1138,161 @@ html:root header.top .actions{
 
 function adaptBlock() {
   return `<style id="hana-adapt">\n${ADAPT_CSS}</style>\n`;
+}
+
+// 把 magpie 设置页「常规 → 外观」那只分段控件（跟随系统 / 浅色 / 深色）换成
+// 一枚 HanaSelect 风格的下拉。
+//
+// 为什么是「盖住」而不是改 magpie：内置的 exe 是上游原件，本 App 一行都不动它
+// （README 里写着「未修改 magpie 的任何代码」）。原生 #themeSegs 仍是状态源，
+// 下拉只是它的皮肤与开关，做法与 git-save-load 的 HanaSelect、本 App 设置页的
+// 主题下拉完全一致 —— 原生 <select>/分段控件负责存值，自绘控件负责视觉与交互。
+//
+// 尺寸对齐 magpie 自己的 .segs：高 26px（2 + 22 + 2）、圆角 7px、字号 12px。
+// 颜色全部取注入进页面的 Hana 变量（--card/--line/--fg/--accent/…），换主题时
+// 跟着一起变。
+// 卡片「外观」下拉的选项表。值域两档，语义互相排斥：
+//   auto       跟随 Hana 当前主题（Hana 里换主题，卡片 5 秒内跟上）
+//   Hana 主题名 钉住那一套（不论 Hana 当前用什么）
+//
+// 这份清单与 App 设置页「主题」下拉（ui/settings.html 里的 THEMES）逐项一致：
+// 同一个存储、同一批名字、同一个顺序，两边都要改就一起改。
+// 曾经这里多出「浅色 / 深色」两项，但它们只是把明暗叠在「跟随 Hana」上，
+// 点了视觉上不会变，而且设置页里没有这两项 —— 属于多余，已删。
+// index.js 的 actTheme 里另有一份 VALID 白名单，它只决定参数收不收；
+// 清单本身以这里与 settings.html 为准。
+const THEME_OPTIONS = [
+  ["auto", "自动（跟随 Hana）"],
+  ["midnight", "青夜"],
+  ["midnight-contrast", "青夜 · 高对比"],
+  ["warm-paper", "暖纸"],
+  ["new-warm-paper", "新暖纸"],
+  ["high-contrast", "素白"],
+  ["grass-aroma", "草香"],
+  ["contemplation", "沉思"],
+  ["absolutely", "Absolutely"],
+  ["delve", "Delve"],
+  ["deep-think", "Deep Think"],
+  ["coral", "珊瑚"],
+];
+
+const SELECT_CSS = `html:root.hana-theme-select #themeSegs{
+  display: none !important;
+}
+html:root #hanaThemeSelect.hana-select{
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  box-sizing: border-box;
+  min-width: 132px;
+  height: 26px;
+  padding: 0 8px 0 10px;
+  background: var(--card, rgba(127, 127, 127, .08));
+  border: 1px solid var(--line, rgba(127, 127, 127, .28));
+  border-radius: 7px;
+  color: var(--fg, #e8e9ed);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+html:root #hanaThemeSelect.hana-select:hover{
+  border-color: var(--fg-2, var(--muted, #8b8d98));
+}
+html:root #hanaThemeSelect.hana-select.open{
+  border-color: var(--accent, #6b7dff);
+  box-shadow: 0 0 0 3px var(--sel, rgba(107, 125, 255, .22));
+}
+html:root #hanaThemeSelect .hana-select-label{
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html:root #hanaThemeSelect .hana-select-chevron{
+  flex: none;
+  width: 10px;
+  height: 10px;
+  opacity: .55;
+  background-color: currentColor;
+  -webkit-mask-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23fff' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+  mask-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23fff' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  transition: transform .15s ease;
+}
+html:root #hanaThemeSelect.open .hana-select-chevron{
+  transform: rotate(180deg);
+}
+html:root .hana-select-panel{
+  position: fixed;
+  z-index: 4000;
+  box-sizing: border-box;
+  min-width: 140px;
+  max-height: 240px;
+  padding: 4px;
+  background: var(--pop-bg, var(--card, #232830));
+  border: 1px solid var(--line, rgba(127, 127, 127, .28));
+  border-radius: 8px;
+  box-shadow: var(--shadow, 0 16px 44px rgba(0, 0, 0, .35));
+  overflow-y: auto;
+  opacity: 0;
+  transform: scale(.97) translateY(-4px);
+  transform-origin: top left;
+  transition: opacity .12s ease, transform .12s ease;
+  pointer-events: none;
+}
+html:root .hana-select-panel.open{
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+html:root .hana-select-sep{
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line, rgba(127, 127, 127, .28));
+}
+html:root .hana-select-option{
+  position: relative;
+  padding: 6px 12px 6px 26px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--fg, #e8e9ed);
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background .12s ease;
+}
+html:root .hana-select-option:hover{
+  background: var(--pill-hover, rgba(127, 127, 127, .14));
+}
+html:root .hana-select-option.selected{
+  color: var(--accent, #6b7dff);
+  font-weight: 500;
+}
+html:root .hana-select-option.selected::before{
+  content: "\\2713";
+  position: absolute;
+  left: 9px;
+  color: var(--accent, #6b7dff);
+  font-size: 11px;
+}
+`;
+
+function selectBlock() {
+  return `<style id="hana-select">\n${SELECT_CSS}</style>\n`;
 }
 
 function hiddenBlock() {
@@ -766,6 +1406,9 @@ function inject(html, vars) {
   //  而注入常量这条路径不靠任何网络请求，最稳。）
   const seed =
     `<script id="hana-theme-seed">window.__hanaThemeChoice=${JSON.stringify(state.themeChoice || "auto")};` +
+    `window.__hanaThemeList=${JSON.stringify(THEME_OPTIONS)};` +
+    // 首屏变量表对应的主题名（auto 时服务端已解析成具体主题名）
+    `window.__hanaSeedName=${JSON.stringify(state.themeApplied || "")};` +
     `window.__hanaVars=${JSON.stringify(vars || null)};</script>\n`;
   // ① 垫片必须在 magpie 自己的脚本之前
   if (/<head>/i.test(out)) out = out.replace(/<head>/i, "<head>" + BASE_SHIM + seed);
@@ -774,7 +1417,7 @@ function inject(html, vars) {
     else out = seed + out;
   }
   // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
-  const tail = themeBlock() + adaptBlock() + hiddenBlock() + THEME_CLIENT;
+  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + THEME_CLIENT + SELECT_CLIENT;
   if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
   else out += tail;
   state.rewrites += 1;
@@ -806,6 +1449,52 @@ function sendHtml(res, text) {
   res.end(buf);
 }
 
+// 上游不可用时该怎么回。
+//
+// 这里是「把那片红字生出来」的地方：magpie 的前端拿 /api/* 的响应体直接当正文用，
+// 一旦收到整页 HTML，它会把那堆标签原样打印到界面上（用户看到的就是一整屏 HTML）。
+// 所以接口路径一律 503 + JSON，前端安安静静当成一次失败；
+// 只有真的文档导航才给等待页（那张「magpie 正在启动…」是要给人看的）。
+function apiLikePath(path) {
+  return /^\/(api|v1|v1beta|gateway)(\/|$)/.test(path);
+}
+// 接口路径、以及一切不要文档的请求（accept 不含 text/html）→ JSON；
+// 只有要文档的（accept 带 text/html，即真正的导航/文档加载）才给等待页。
+//
+// 为什么不看 sec-fetch-mode：它是浏览器的禁止头，宿主加载卡片文档那一下实测带的是
+// `sec-fetch-mode: cors`（不是 navigate），拿它判断会把文档也判成接口，
+// 于是等待页变成一坨 JSON。accept 才是稳的那一个。
+function wantsJson(req) {
+  const p = servicePath((req && req.url) || "/");
+  if (apiLikePath(p)) return true;
+  const h = (req && req.headers) || {};
+  const accept = String(h.accept || "");
+  if (accept.indexOf("text/html") >= 0) return false;
+  return true;
+}
+function sendUnavailable(req, res, reason) {
+  const why = reason || "magpie 还没就绪";
+  const asJson = wantsJson(req);
+  // 诊断：降级时到底判成了什么、入站头长什么样。
+  // 这张卡出问题时最常被问的就是「为什么这里吐的是 JSON / 为什么吐的是整页 HTML」。
+  try {
+    const h = (req && req.headers) || {};
+    state.diag.push({
+      at: new Date().toISOString(), kind: "degraded",
+      url: req && req.url, path: servicePath((req && req.url) || "/"),
+      accept: h.accept || "", fetchMode: h["sec-fetch-mode"] || "",
+      dest: h["sec-fetch-dest"] || "", asJson: asJson, reason: why,
+    });
+    if (state.diag.length > 80) state.diag.shift();
+  } catch { /* 忽略 */ }
+  if (asJson) {
+    state.lastError = state.lastError || why;
+    sendJson(res, { ok: false, error: why, retryAfterMs: 1500 }, 503);
+    return;
+  }
+  sendHtml(res, waitingPage(why === "magpie 还没就绪" ? "" : why));
+}
+
 // 宿主把本服务挂在 /api/apps/<id>/routes/_runtime/<rid>[/_surface/<ticket>]/ 下。
 // 浏览器对相对资源（app.css / boot.js）会带上这个前缀；magpie 自己只认根路径，
 // 原样转发它只会回 404。这里把宿主前缀剥掉，还原成服务内路径再转发。
@@ -826,7 +1515,7 @@ function note(url, status, ct, extra) {
 function proxyRequest(clientReq, clientRes) {
   if (!state.upstreamPort) {
     clientReq.resume();
-    sendHtml(clientRes, waitingPage(state.lastError || ""));
+    sendUnavailable(clientReq, clientRes, state.lastError || "magpie 还没就绪");
     return;
   }
   state.requests += 1;
@@ -928,22 +1617,29 @@ function proxyRequest(clientReq, clientRes) {
     upRes.on("error", (e) => {
       state.lastError = "上游读失败：" + (e && e.message);
       try {
-        if (!clientRes.headersSent) sendHtml(clientRes, waitingPage(state.lastError));
+        if (!clientRes.headersSent) sendUnavailable(clientReq, clientRes, state.lastError);
         else clientRes.end();
       } catch { /* 忽略 */ }
     });
   });
 
   upReq.on("error", (e) => {
-    state.lastError = String(e && e.message ? e.message : e);
-    log("上游连接失败：" + state.lastError);
-    note(clientReq.url, 0, "upstream-error");
+    const msg = String(e && e.message ? e.message : e);
+    // 我们自己掐的超时不算「连不上上游」：慢不等于坏，更不能拿它去触发自愈
+    // 重拉（那会在安装中途把 magpie 杀掉）。真正连不上才计数。
+    const ours = /上游超时/.test(msg);
+    state.lastError = msg;
+    log("上游连接失败：" + msg);
+    note(clientReq.url, 0, ours ? "upstream-timeout" : "upstream-error");
+    if (!ours) noteUpstreamFailure();
     try {
-      if (!clientRes.headersSent) sendHtml(clientRes, waitingPage("上游连接失败：" + state.lastError));
+      if (!clientRes.headersSent) sendUnavailable(clientReq, clientRes, "上游连接失败：" + msg);
       else clientRes.end();
     } catch { /* 忽略 */ }
   });
-  upReq.setTimeout(30000, () => { try { upReq.destroy(new Error("上游超时")); } catch { /* 忽略 */ } });
+  upReq.setTimeout(upstreamTimeoutFor(clientReq.url), () => {
+    try { upReq.destroy(new Error(`上游超时（${Math.round(upstreamTimeoutFor(clientReq.url) / 1000)} 秒无动静）`)); } catch { /* 忽略 */ }
+  });
 
   clientReq.pipe(upReq);
   clientReq.on("error", () => { try { upReq.destroy(); } catch { /* 忽略 */ } });
@@ -957,6 +1653,22 @@ function readJson(req) {
     req.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); } catch { resolve({}); } });
     req.on("error", () => resolve({}));
   });
+}
+
+// 上游要等多久才算「没救了」。30 秒对日常够用，但对几件慢事远远不够：
+// 第一次装插件要先下 86MB 的 bun（magpie plugin add），检查更新要挨个问 npm，
+// 装更新要落盘再重起。这些操作进行时 magpie 是一片安静的，socket 空闲超时
+// 会把它误判成断线（实测：30 秒报「上游超时」，装插件就是这么装不上的）。
+// 所以：慢活儿给足，其余也从宽。
+const SLOW_UPSTREAM_PATHS = [
+  "/api/plugins/add", "/api/plugins/remove", "/api/plugins/update", "/api/plugins/upgrade",
+  "/api/plugins/check", "/api/plugins/mirror", "/api/plugins/search", "/api/plugin-signin/",
+  "/api/update",
+];
+function upstreamTimeoutFor(path) {
+  const p = String(path || "");
+  if (SLOW_UPSTREAM_PATHS.some((s) => p.startsWith(s))) return 15 * 60 * 1000;
+  return 3 * 60 * 1000;
 }
 
 function sendJson(res, obj, status = 200) {
@@ -998,6 +1710,7 @@ async function handleInternal(req, res) {
       themeApplied: state.themeApplied,
       themeVarsCached: !!(themeCache && themeCache.vars),
       diagCount: state.diag.length,
+      env: envSnapshot(),
     });
     return true;
   }
@@ -1041,7 +1754,9 @@ async function handleInternal(req, res) {
   // 而卡片 iframe 的 URL 参数只是挂载当刻的快照。用户随后在 Hana 里换主题，
   // 只有这个端点能反映出来。
   if (path === "/_hana/host-theme") {
-    sendJson(res, { ok: true, ...hostThemeInfo() });
+    // choice：卡片里的「外观」下拉与设置页的主题下拉共用同一个选择，
+    // 所以把这个值一并给页面，它才能把标签对到当前那一项。
+    sendJson(res, { ok: true, choice: state.themeChoice || "auto", ...hostThemeInfo() });
     return true;
   }
 
@@ -1062,6 +1777,145 @@ async function handleInternal(req, res) {
 }
 
 // ── 启停 magpie ──────────────────────────────────────────────────────────────
+// magpie 会自更新：它把自己换掉、在新端口重新起来（我们用 --addr 127.0.0.1:0，
+// 端口本来就是随机的）。这一整块的职责就是「别把上游指丢」。
+// 三道路径，从便宜到狠：
+//   ① 它自己打出来的 `magpie web on …` 行：每一次都认，端口变了就换；
+//   ② 子进程退出：过一会儿重拉（有次数上限）；
+//   ③ 连着连不上上游且子进程还活着：先请它退场再重拉。
+// 宿主给 App 运行时的环境是沙箱的：USERPROFILE/HOME/APPDATA/LOCALAPPDATA 全指向
+// app-data/<id>/.runtime-tmp（实测），ENV 只有 20 个。
+//
+// 对 magpie 这很致命：它判断「本机装了哪些 agent」，靠的就是拿用户目录去拼各家配置文件
+// 的路径（~/.codex/config.toml、~/.claude/…、%APPDATA%/Code/…）。同一个 exe，
+// 在真环境里认 9 个，在沙箱里只认 1 个 —— 用户在卡片里看到的永远是「没识别到」。
+//
+// 这里把真实用户目录还原出来（HOMEDRIVE+HOMEPATH 未被沙箱改过，是真的），
+// 只覆盖这几个目录变量，其余环境照旧继承。认不出来就不动，宁可不全也不乱改。
+function realUserEnv() {
+  try {
+    const cur = String(process.env.USERPROFILE || "");
+    const looksSandbox = cur.includes("\\.runtime-tmp") || cur.includes("/.runtime-tmp");
+    const fromParts = (process.env.HOMEDRIVE || "") + (process.env.HOMEPATH || "");
+    let home = "";
+    if (fromParts && existsSync(fromParts)) home = fromParts;
+    if (!home && !looksSandbox && cur && existsSync(cur)) home = cur;
+    if (!home && looksSandbox) {
+      // 兜底：从沙箱路径里反切出真实家目录（…\Users\SSS\.hanako\… -> …\Users\SSS）
+      const cut = cur.indexOf("\\.hanako");
+      if (cut > 0) {
+        const guess = cur.slice(0, cut);
+        if (existsSync(guess)) home = guess;
+      }
+    }
+    if (!home) return null;
+    const env = { ...process.env };
+    env.USERPROFILE = home;
+    env.HOME = home;
+    const roaming = join(home, "AppData", "Roaming");
+    const local = join(home, "AppData", "Local");
+    if (existsSync(roaming)) env.APPDATA = roaming;
+    if (existsSync(local)) env.LOCALAPPDATA = local;
+    delete env.XDG_CONFIG_HOME;   // 别让它把配置写到沙箱之外的地方
+    return env;
+  } catch {
+    return null;
+  }
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// 端口是否有人应答（TCP 连接就够，不需要读内容）。
+function portAnswers(port, timeoutMs = 900) {
+  return new Promise((resolve) => {
+    if (!port) return resolve(false);
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; try { sock.destroy(); } catch { /* 忽略 */ } resolve(v); };
+    const sock = connect({ host: "127.0.0.1", port });
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
+}
+
+// 我们那只子进程退出后、准备重拉之前，先确认「是不是它自己重起了一只」。
+// magpie 装完更新会把自己重起，参数跟原来一样 —— 所以钉住的端口一会儿就有人应答。
+// 早先没这一步，就会出现两只同源 magpie 抢同一个 data/（实测：更新完真的变成两只）。
+async function adoptIfServing(port) {
+  for (let i = 0; i < 6; i++) {
+    if (await portAnswers(port)) {
+      state.upstreamPort = port;
+      state.phase = "ready";
+      state.lastError = null;
+      state.upstreamFailures = 0;
+      state.respawnCount = 0;
+      log(`端口 ${port} 已有人在服务（自更新后的重起），接回来，不再重拉`);
+      process.stdout.write(`MAGPIE_UPSTREAM_READY port=${port}\n`);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// 找一个空闲端口钉住。为什么不用 0：随机端口在自更新重起后会变，
+// 而那次重起不是我们的子进程，我们看不到它新报的端口。钉住就不会丢。
+function pickFreePort() {
+  return new Promise((resolve) => {
+    const s = createServer();
+    s.once("error", () => resolve(0));
+    s.listen(0, "127.0.0.1", () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+  });
+}
+
+let respawnTimer = null;
+function scheduleRespawn(delayMs) {
+  if (respawnTimer || state.phase === "stopping") return;
+  if (state.respawnCount >= 6) {
+    state.phase = "error";
+    state.lastError = "magpie 反复退出，已停止自动重拉（可在设置页里手动启动）";
+    log(state.lastError);
+    return;
+  }
+  const delay = typeof delayMs === "number" ? delayMs : Math.min(8000, 1500 * (state.respawnCount + 1));
+  respawnTimer = setTimeout(() => {
+    respawnTimer = null;
+    if (state.phase === "stopping") return;
+    if (pidAlive(state.magpiePid)) return;   // 已经有一只活着了，别拉第二只
+    state.respawnCount += 1;
+    log(`重新拉起 magpie（第 ${state.respawnCount} 次）`);
+    startMagpie({ exe: state.exePath, cwd: state.exeCwd });
+  }, delay);
+  try { respawnTimer.unref?.(); } catch { /* 忽略 */ }
+}
+
+// 上游连着连不上：我们守着的那个端口上已经没人了。
+// 阈值放宽一点，免得 magpie 自更新时那几秒的拒绝就把一只健康的实例请下场。
+function noteUpstreamFailure() {
+  state.upstreamFailures = (state.upstreamFailures || 0) + 1;
+  if (state.upstreamFailures < 6) return;
+  state.upstreamFailures = 0;
+  if (state.phase === "stopping") return;
+  log("上游连续拒绝连接，判定为失联，重新拉起 magpie");
+  state.upstreamPort = 0;
+  state.upstreamKey = "";
+  const pid = state.magpiePid;
+  state.magpiePid = null;                    // 先置空：它退场时就不再重复排重拉
+  if (pid && pidAlive(pid)) {
+    try { process.kill(pid, "SIGTERM"); } catch { /* 忽略 */ }
+    const t = setTimeout(() => { try { process.kill(pid, "SIGKILL"); } catch { /* 忽略 */ } }, 2500);
+    t.unref?.();
+  }
+  state.phase = "waiting-magpie";
+  scheduleRespawn(600);
+}
+
 function stopMagpie() {
   const pid = state.magpiePid;
   state.magpiePid = null;
@@ -1071,19 +1925,37 @@ function stopMagpie() {
   t.unref?.();
 }
 
-function startMagpie({ exe, cwd }) {
+async function startMagpie({ exe, cwd }) {
   if (!exe || !existsSync(exe)) {
     state.phase = "error";
     state.lastError = `magpie 可执行文件不存在：${exe}`;
     log(state.lastError);
     return;
   }
+  state.exePath = exe;   // 重拉时要用（自更新后 exe 还是这个路径，内容已经是新的）
+  state.exeCwd = cwd;
+  state.exePath = exe;   // 重拉时要用（自更新后 exe 还是这个路径，内容已经是新的）
+  state.exeCwd = cwd;
   try { mkdirSync(join(cwd, "data"), { recursive: true }); } catch { /* 忽略 */ }
 
-  const args = ["web", "--addr", "127.0.0.1:0", "--no-open"];
+  if (!state.upstreamPortFixed) state.upstreamPortFixed = await pickFreePort();
+  if (!state.webKey) state.webKey = randomBytes(24).toString("base64url");
+  const addr = state.upstreamPortFixed ? `127.0.0.1:${state.upstreamPortFixed}` : "127.0.0.1:0";
+  const args = ["web", "--addr", addr, "--no-open"];
+  const childEnv = realUserEnv();
+  const env = { ...(childEnv || process.env), MAGPIE_WEB_KEY: state.webKey };
   log(`spawn: ${exe} ${args.join(" ")}  (cwd=${cwd})`);
+  if (childEnv) log(`传给 magpie 的用户目录：${childEnv.USERPROFILE}（宿主给的是 ${process.env.USERPROFILE || ""}）`);
+  else log("没认出真实的用户目录，按宿主给的环境启动（agent 探测可能不全）");
+  state.upstreamKey = state.webKey;   // key 固定，重起后照样能转发
 
-  const child = spawn(exe, args, { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(exe, args, {
+    cwd,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  });
+  const spawnedAt = Date.now();
   state.magpiePid = child.pid;
   state.phase = "waiting-magpie";
 
@@ -1092,12 +1964,17 @@ function startMagpie({ exe, cwd }) {
     buffer += chunk.toString("utf8");
     const clean = buffer.replace(ANSI, "");
     const m = clean.match(/magpie web on\s+https?:\/\/[\d.]+:(\d+)\/\?k=([^\s]+)/);
-    if (m && !state.upstreamPort) {
+    // 每一条公告都认：它自更新后会换个端口重新起来，只认第一次的话，
+    // 代理就永远指着那个已经没人听的旧端口（卡片上就是「上游连接失败」）。
+    if (m && (parseInt(m[1], 10) !== state.upstreamPort || m[2] !== state.upstreamKey)) {
+      const moved = state.upstreamPort !== 0;
       state.upstreamPort = parseInt(m[1], 10);
       state.upstreamKey = m[2];
       state.phase = "ready";
       state.lastError = null;
-      log(`上游就绪：127.0.0.1:${state.upstreamPort}（key 已取得）`);
+      state.upstreamFailures = 0;
+      state.respawnCount = 0;      // 跑起来一只稳定的，计数归零
+      log(`${moved ? "上游端口变更" : "上游就绪"}：127.0.0.1:${state.upstreamPort}（key 已取得）`);
       process.stdout.write(`MAGPIE_UPSTREAM_READY port=${state.upstreamPort}\n`);
     }
     if (clean.length > 40000) buffer = clean.slice(-8000);
@@ -1105,15 +1982,24 @@ function startMagpie({ exe, cwd }) {
   child.stdout.on("data", onChunk);
   child.stderr.on("data", onChunk);
 
-  child.on("exit", (code, sig) => {
+  child.on("exit", async (code, sig) => {
     if (state.magpiePid !== child.pid) return;
     state.magpiePid = null;
-    state.upstreamPort = 0;
-    if (state.phase !== "stopping") {
-      state.phase = "error";
-      state.lastError = `magpie 退出（code=${code} signal=${sig}）`;
-      log(state.lastError);
+    if (state.phase === "stopping") { state.upstreamPort = 0; return; }
+    state.lastError = `magpie 退出（code=${code} signal=${sig}）`;
+    log(state.lastError);
+    // 跑得太短就退出：多半是钉住的端口被占了（或 exe 有问题）。
+    // 把端口和 key 的钉子放松，给下一次一个重新选的机会，别在一个坏端口上死循环。
+    if (Date.now() - spawnedAt < 4000) {
+      log("它起来后很快就退出，下次重新选端口");
+      state.upstreamPortFixed = 0;
+      state.respawnCount = 0;
     }
+    const port = state.upstreamPortFixed || state.upstreamPort;
+    state.upstreamPort = 0;
+    if (await adoptIfServing(port)) return;   // 是它自己重起的，接回来
+    state.phase = "error";
+    scheduleRespawn();
   });
   child.on("error", (e) => {
     state.phase = "error";
@@ -1176,7 +2062,7 @@ function main() {
       state.lastError = "转发异常：" + (e && e.message ? e.message : String(e));
       log(state.lastError);
       try {
-        if (!res.headersSent) sendHtml(res, waitingPage(state.lastError));
+        if (!res.headersSent) sendUnavailable(req, res, state.lastError);
         else res.end();
       } catch { /* 忽略 */ }
     }
