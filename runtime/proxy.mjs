@@ -279,7 +279,14 @@ const THEME_CLIENT = `<script id="hana-theme-client">
   var hanaShell = false;
   window.addEventListener("message", function (e) {
     var d = e.data;
-    if (d && d.type === "magpie-hana:shell") hanaShell = true;
+    if (!d || typeof d !== "object") return;
+    if (d.type === "magpie-hana:shell") hanaShell = true;
+    // 壳子（route 卡片的薄页面）会把它那边的时刻发进来，用来把
+    // 「壳子开始 → 卡片就绪」与页面自己的时钟对齐；卡片那几秒到底落在谁身上，
+    // 靠这条时间线判断，而不是靠猜。
+    if (d.type === "magpie-hana:timing") {
+      report("card-shell", { phase: d.phase, t0: d.t0, t1: d.t1, now: Date.now() });
+    }
   });
 
   // ── 变量表 ───────────────────────────────────────────────────────────

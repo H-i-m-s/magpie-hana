@@ -32,6 +32,7 @@
 <iframe id="frame" style="display:none" allow="clipboard-read; clipboard-write"></iframe>
 <script>
 (function () {
+  var T0 = Date.now();          // 壳子脚本开始执行：近似「宿主决定加载这张卡片」
   var ABS = "/api/apps/magpie-hana/routes/magpie-hana";
   var frame = document.getElementById("frame");
   var msg = document.getElementById("msg");
@@ -56,6 +57,7 @@
         frame.src = "http://127.0.0.1:" + port + "/";
         frame.style.display = "block";
         msg.style.display = "none";
+        postTiming("src-set");
         // 反复打几声招呼：iframe 里的脚本可能比我们晚一步就绪，
         // 收到之后它才会把主题选择的持久化交给这里代转。
         announceShell();
@@ -111,16 +113,23 @@
       "<br>候选全局：" + (globals.length ? globals.join(", ") : "（无）");
   }
 
+  function postTiming(phase) {
+    try {
+      frame.contentWindow.postMessage({ type: "magpie-hana:timing", phase: phase, t0: T0, t1: Date.now() }, "*");
+    } catch (_) {}
+  }
+
   function announceShell() {
     [80, 400, 1200, 2500, 5000].forEach(function (d) {
       setTimeout(function () {
         try { frame.contentWindow.postMessage({ type: "magpie-hana:shell" }, "*"); } catch (_) {}
+        postTiming("shell-ping");
       }, d);
     });
   }
 
   // 主题选择的持久化：iframe 里的页面把选择发过来，这里落到 App 路由。
-  window.addEventListener("message", function (e) {
+  frame.addEventListener("load", function () { postTiming("frame-loaded"); });  window.addEventListener("message", function (e) {
     var d = e.data;
     if (!d || d.type !== "magpie-hana:choice") return;
     fetch(ABS + "/theme", {
