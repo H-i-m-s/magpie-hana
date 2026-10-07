@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Magpie 诊断卡</title>
+<!--
+  这是一张「什么都不做」的卡片，唯一目的是把问题一分为二（2026-10-08）：
+
+  现象：magpie 那张卡每次打开要等约 5 秒，而页面自己 0.4 秒就好了。
+  已经排除：没有新建 webview 进程、没有 app 重载、代理侧没有异常请求、
+  页面侧时钟正常（壳子几十毫秒、内层页面 0.3 秒就绪）。
+  剩下的可能只有两类：
+    A. 慢在这个 App 的卡片实体上（旧实例、trust、声明形态），与内容无关；
+    B. 慢在这张卡自己的内容上（壳子里的 /status 取端口、内嵌 iframe）。
+
+  这张卡就是 A 的对照组：它是同一个 App 的卡片，但内容只有一行字，
+  不取端口、不内嵌、不发任何请求。
+
+  结果怎么读：
+    · 它也等约 5 秒  → 问题在 A 类（App/实体层），magpie 那张卡的内容无关；
+    · 它秒开          → 问题在 B 类（壳子的取端口或内嵌那一步）。
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; color: #c9d4e0;
+    font: 13px/1.8 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { padding: 18px; }
+  b { color: #fff; }
+  code { color: #8bd0ff; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <b>Magpie 诊断卡</b><br>
+  这一页只有这行字：不取端口、不内嵌、不发请求。<br>
+  打开它的快慢，只反映「这个 App 的卡片本身」要等多久。
+</div>
+</body>
+</html>
