@@ -1347,6 +1347,23 @@ const BASE_SHIM = `<script id="hana-base">
   }
   window.__hanaDiag = report;
   report('boot');
+  // 渲染侧的时钟：光看 DOM-ready 不够，得知道「首绘、最大内容绘、有没有长任务」
+  // ——那几秒到底是在等网，还是在等渲染，就靠这三个观察器分开。
+  // 只用 PerformanceObserver，不改任何页面行为；不支持就算了。
+  try {
+    if (window.PerformanceObserver) {
+      new PerformanceObserver(function(list){
+        list.getEntries().forEach(function(en){ report('paint', { name: String(en.name), ms: Math.round(en.startTime) }); });
+      }).observe({ entryTypes: ['paint'] });
+      new PerformanceObserver(function(list){
+        var es = list.getEntries(); var last = es[es.length - 1];
+        if (last) report('lcp', { ms: Math.round(last.startTime), tag: String((last.element && last.element.tagName) || '') });
+      }).observe({ entryTypes: ['largest-contentful-paint'] });
+      new PerformanceObserver(function(list){
+        list.getEntries().forEach(function(en){ report('longtask', { ms: Math.round(en.duration) }); });
+      }).observe({ entryTypes: ['longtask'] });
+    }
+  } catch (e) {}
   window.addEventListener('DOMContentLoaded', function(){ report('dom-ready'); });
   window.addEventListener('load', function(){
     var sheets = 0; try { sheets = document.styleSheets.length; } catch (e) {}
@@ -1509,7 +1526,9 @@ function servicePath(url) {
 function note(url, status, ct, extra) {
   try {
     state.recent.push({ t: Date.now(), url, path: servicePath(url), status, ct: ct || "", ...(extra || {}) });
-    if (state.recent.length > 40) state.recent.shift();
+    // 300 条：一次卡片加载就有 30~40 个请求，早先的 40 条一圈就被挤掉了，
+    // 结果想回看「导航请求到第一个资源之间隔了多久」时已经没数据了。
+    if (state.recent.length > 300) state.recent.shift();
   } catch { /* 忽略 */ }
 }
 
