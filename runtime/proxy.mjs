@@ -1496,29 +1496,7 @@ const BASE_SHIM = `<script id="hana-base">
 // ── 「从本机导入用量信息」（magepie 设置页 → 同步与备份，最下面一行）──────────────
 // magepie 支持便携目录，所以本 App 带的是第二份 magepie，它的账本从零开始。
 // 这一行就是把它本机那份的第一份 magepie 的历史并过来，任何人装上都能用。
-const IMPORT_CSS = `html:root .hana-import-ctl{
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-}
-html:root .hana-import-btn{
-  height: 26px;
-  padding: 0 12px;
-  font: inherit;
-  font-size: 12px;
-  line-height: 1;
-  color: var(--fg, #e8e9ed);
-  background: var(--pill, var(--card, rgba(127, 127, 127, .10)));
-  border: 1px solid var(--line, rgba(127, 127, 127, .28));
-  border-radius: 7px;
-  cursor: default;
-  transition: border-color .15s ease, background .15s ease, color .15s ease;
-}
-html:root .hana-import-btn:hover{
-  border-color: var(--fg-2, var(--muted, #8b8d98));
-}
-html:root .hana-import-btn.armed{
-  border-color: var(--accent, #6b7dff);
+const IMPORT_CSS = `html:root .hana-import-btn.armed{
   color: var(--accent, #6b7dff);
 }
 html:root .hana-import-btn:disabled{
@@ -1599,15 +1577,17 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
     name.textContent = "从本机导入用量信息";
     var sub = document.createElement("div");
     sub.className = "sub";
-    sub.textContent = "这台机器上如果还有另一份 magpie（如 ~/.config/magpie），把它的用量、配额与路由记录并进这里。可以反复导入，重复的不会算两遍。导入时 magpie 会重启一次，正在跑的请求会中断。";
+    sub.textContent = "把本机上另一份 magpie（如 ~/.config/magpie）的用量、配额与路由记录并进这里；可反复导入，重复的不算两遍。导入时 magpie 会重启一次。";
     who.appendChild(name);
     who.appendChild(sub);
     var ctl = document.createElement("div");
-    ctl.className = "hana-import-ctl";
+    // 用 magpie 自己的 .val：它自己的同步页就是 who + val，动作靠 .who 的 flex:1 推到右边。
+    // 按钮也用它那个 text 类（纯文字，无框），这样跟「设置」「导出…」那几行排在一起是一个样子。
+    ctl.className = "val";
     var b = document.createElement("button");
     b.type = "button";
     b.id = "hanaImportBtn";
-    b.className = "hana-import-btn";
+    b.className = "text hana-import-btn";
     b.textContent = "导入";
     b.onclick = onClick;
     ctl.appendChild(b);
@@ -1630,7 +1610,7 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
       if (f.added > 0) parts.push(f.name.replace("routing/", "路由 ") + " +" + f.added);
     }
     if (!parts.length) return "本机那份没有这里还缺的记录，没有变化。";
-    return "已并入：" + parts.join("、") + "。原样备份留在 App 数据目录的 import-backup 下。";
+    return "已并入：" + parts.join("、") + "。备份留在数据目录的 import-backup 里。";
   }
 
   async function onClick() {
