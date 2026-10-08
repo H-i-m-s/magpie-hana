@@ -19,7 +19,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { userInfo } from "node:os";
 import { connect } from "node:net";
@@ -1933,6 +1933,141 @@ function sendJson(res, obj, status = 200) {
   return true;
 }
 
+// ── 生图（够给宿主那边的媒体适配器用）─────────────────────────────────────
+// 为什么放在这里而不是适配器里：
+//   App 的 ctx.network.fetch 只放行清单 network.allowedHosts 里列过的主机，而清单里
+//   只有 127.0.0.1。magpie 的网关（只监听回环）已经能出图，但它把厂商的图以 **URL**
+//   交回来（WorkBuddy 给的是腾讯云 CDN 上一条带签名的链接），适配器自己去下就撞白名单：
+//     Plugin network.fetch host "…cos.ap-beijing.myqcloud.com" is not declared in manifest network.allowedHosts
+//   把 CDN 写进清单等于白名单跟着厂商变，而且每加一个主机都要用户重新审一次。
+//   所以改成：本进程（App 申请来的 runtime，申请时就是 network: external，也是 magpie
+//   的父进程，本来就整棵树连着外网）跑完整个来回，适配器只跟自己家的 127.0.0.1 说话。
+//   下载完把文件直接落到成品目录，只回文件名：几 MB 的图不必再经 JSON 过一遍宿主的
+//   门（那条路还受清单 8MiB 响应上限约束）。
+const GATEWAY_BASE = "http://127.0.0.1:3425";
+const DRAW_TIMEOUT_MS = 5 * 60 * 1000 + 30 * 1000;   // magpie 那边上限 5 分钟
+const DRAW_MAX_BYTES = 64 * 1024 * 1024;
+
+function extOfMimeType(mime, fallback) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  if (m.includes("gif")) return ".gif";
+  if (m.includes("avif")) return ".avif";
+  return fallback || ".png";
+}
+
+function extOfImageUrl(url) {
+  const raw = String(url || "").split("?")[0].split("#")[0];
+  const m = /\.[a-z0-9]{2,5}$/i.exec(raw);
+  const ext = m ? m[0].toLowerCase() : "";
+  return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"].includes(ext) ? ext : ".png";
+}
+
+async function fetchTimed(url, init, ms) {
+  if (typeof fetch !== "function") {
+    throw new Error(`这个 Node 运行时（${process.version}）没有全局 fetch，下不了厂商返回的图片`);
+  }
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { ...(init || {}), signal: ac.signal });
+  } finally { clearTimeout(t); }
+}
+
+async function runDraw(b) {
+  const model = String(b.model || "").trim();
+  const prompt = String(b.prompt || "").trim();
+  if (!model || !prompt) return { ok: false, error: "生图需要 model 与 prompt" };
+  const outDir = String(b.outDir || "").trim() || join(process.cwd(), "generated");
+  const tmpDir = String(b.tmpDir || "").trim() || join(process.cwd(), "tmp", "draw-" + Date.now().toString(36));
+
+  // 只传 magpie 真认的字段（它读 JSON 时只挑这几个键）。
+  const body = { model, prompt };
+  for (const k of ["n", "size", "quality", "background", "output_format", "images"]) {
+    const v = b[k];
+    if (v !== undefined && v !== null && v !== "") body[k] = v;
+  }
+
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await fetchTimed(GATEWAY_BASE + "/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        // 网关只监听回环、接受任何 token，这个头只决定这次生成记在谁名下。
+        authorization: "Bearer magpie-hanako",
+        "user-agent": "magpie-hana/1",
+        accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    }, DRAW_TIMEOUT_MS);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    return { ok: false, error: /abort/i.test(msg) ? "生图超时（magpie 那边上限 5 分钟）" : "连不上 magpie 网关：" + msg };
+  }
+
+  const text = await res.text();
+  if (!res.ok) {
+    let said = text;
+    try {
+      const ej = JSON.parse(text);
+      said = (ej && ej.error && ej.error.message) || (ej && ej.message) || text;
+    } catch { /* 原样 */ }
+    return { ok: false, error: `magpie 生图失败（HTTP ${res.status}）：${String(said).slice(0, 400)}` };
+  }
+
+  let j = null;
+  try { j = JSON.parse(text); } catch { return { ok: false, error: `magpie 的回包不是 JSON：${text.slice(0, 200)}` }; }
+  const items = Array.isArray(j && j.data) ? j.data : [];
+  if (!items.length) {
+    return { ok: false, error: `magpie 说成功了但没给图片${j && j.text ? "：" + String(j.text).slice(0, 200) : ""}` };
+  }
+
+  mkdirSync(tmpDir, { recursive: true });
+  mkdirSync(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const files = [];
+  let i = 0;
+  for (const it of items) {
+    i += 1;
+    let buf = null;
+    let ext = ".png";
+    const b64 = it && typeof it.b64_json === "string" ? it.b64_json : "";
+    const url = it && typeof it.url === "string" ? it.url : "";
+    if (b64) {
+      buf = Buffer.from(b64, "base64");
+      ext = extOfMimeType(it.mime_type, ".png");
+    } else if (url) {
+      let r;
+      try {
+        r = await fetchTimed(url, { headers: { "user-agent": "magpie-hana/1" } }, 120000);
+      } catch (e) {
+        return { ok: false, error: `下载厂商返回的图片失败：${String((e && e.message) || e)}` };
+      }
+      if (!r.ok) return { ok: false, error: `下载厂商返回的图片失败：HTTP ${r.status}` };
+      buf = Buffer.from(await r.arrayBuffer());
+      ext = extOfMimeType(r.headers && r.headers.get ? r.headers.get("content-type") : "", extOfImageUrl(url));
+    }
+    if (!buf || !buf.length) continue;
+    if (buf.length > DRAW_MAX_BYTES) {
+      return { ok: false, error: `图片太大（${Math.round(buf.length / 1048576)}MB），不落盘` };
+    }
+    const name = `magpie-${stamp}-${i}${ext}`;
+    // 先落本次任务自己的暂存目录，下完了再发布到成品目录：
+    // 宿主在成品目录里扫新文件，半张图不该被它看见（同卷 rename，原子）。
+    writeFileSync(join(tmpDir, name), buf);
+    renameSync(join(tmpDir, name), join(outDir, name));
+    files.push(name);
+  }
+  if (!files.length) return { ok: false, error: "图片拿到了但没能落盘" };
+
+  const ms = Date.now() - t0;
+  log(`生图完成：${model} → ${files.join(", ")}（${(ms / 1000).toFixed(1)}s）`);
+  return { ok: true, model: j.model || model, files, usage: j.usage || null, ms };
+}
+
 async function handleInternal(req, res) {
   const path = (req.url || "/").split("?")[0];
 
@@ -1948,6 +2083,17 @@ async function handleInternal(req, res) {
     }
     sendJson(res, { ok: true, count: state.diag.length, diag: state.diag.slice(-30) });
     return true;
+  }
+
+  // 生图：适配器把参数交给这里，整段来回（网关 + 下载 + 落盘）都在本进程完成。
+  if (path === "/_hana/draw" && req.method === "POST") {
+    const b = await readJson(req);
+    try {
+      const out = await runDraw(b);
+      return sendJson(res, out, out.ok ? 200 : 502);
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, 502);
+    }
   }
 
   if (path === "/_hana/status") {

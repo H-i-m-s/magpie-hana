@@ -22,8 +22,16 @@
 // 为什么 submit 是异步的：
 //   一次生成最长可能等 5 分钟（magpie 的 drawTimeout）。submit 立刻回 taskId，
 //   真正干活在后台，query 轮询结果 —— 和内置的即梦 CLI 应用同一套形状。
+//
+// 为什么出图与下载交给自己的代理进程跑（runtime/proxy.mjs 的 /_hana/draw）：
+//   magpie 把厂商的图以 URL 交回来（WorkBuddy 给的是腾讯云 CDN 上一条带签名的链接），
+//   而 App 的 ctx.network.fetch 只放行清单 network.allowedHosts 里列过的主机（本清单
+//   只有 127.0.0.1）。把各家 CDN 写进清单等于白名单跟着厂商变，每加一个还要用户重审
+//   一次。本 App 本来就申请了一个 network: external 的 runtime（magpie 的父进程，
+//   整棵树连着外网），让那个进程跑完网关与下载、把文件落到成品目录、只回文件名，
+//   这里就只跟 127.0.0.1 说话。
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { extname, isAbsolute, join } from "node:path";
 
 export const GATEWAY_BASE = "http://127.0.0.1:3425";
@@ -31,8 +39,6 @@ export const PROVIDER_ID = "magpie-hana";
 export const PROTOCOL_ID = "magpie-hana-images";
 export const ADAPTER_ID = "magpie-hana-images";
 
-const DRAW_TOKEN = "magpie-hanako";   // 归因用：这次生成算 OpenHanako 的
-const USER_AGENT = "magpie-hana/1";
 const DRAW_TIMEOUT_MS = 295_000;
 const JOB_TTL_MS = 30 * 60 * 1000;
 const MAX_REFS = 4;
@@ -44,20 +50,14 @@ const pick = (...vals) => {
   return "";
 };
 
-function extOfMime(mime, fallback = ".png") {
-  const m = String(mime || "").toLowerCase();
-  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
-  if (m.includes("webp")) return ".webp";
-  if (m.includes("gif")) return ".gif";
-  if (m.includes("avif")) return ".avif";
-  return fallback;
-}
-
-function extOfUrl(url) {
-  const raw = String(url || "").split("?")[0].split("#")[0];
-  const ext = extname(raw).toLowerCase();
-  return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"].includes(ext) ? ext : ".png";
-}
+const MIME_OF_EXT = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".avif": "image/avif",
+};
 
 function sweepJobs() {
   const now = Date.now();
@@ -94,13 +94,18 @@ function dataUrlFor(item) {
   if (/^(https?:|data:)/i.test(asPath)) return asPath;
   if (!isAbsolute(asPath)) throw new Error(`参考图不是绝对路径：${asPath}`);
   const buf = readFileSync(asPath);
-  const mime = extOfMime(extname(asPath).toLowerCase().replace(".jpeg", ".jpg"), "");
-  const m = { ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif" }[mime || ".png"];
-  return `data:${m || "image/png"};base64,${buf.toString("base64")}`;
+  const mime = MIME_OF_EXT[extname(asPath).toLowerCase()] || "image/png";
+  return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
-export function createMagpieImageProvider({ fetchImpl, log = () => {}, warn = () => {} }) {
+export function createMagpieImageProvider({ fetchImpl, proxyBase, log = () => {}, warn = () => {} }) {
   if (typeof fetchImpl !== "function") throw new Error("createMagpieImageProvider 需要 fetchImpl");
+  if (typeof proxyBase !== "function") throw new Error("createMagpieImageProvider 需要 proxyBase（本 App 代理进程的地址）");
+  const proxyUrl = (p) => {
+    const base = String(proxyBase() || "").replace(/\/+$/, "");
+    if (!base) throw new Error("本 App 的代理进程还没就绪（没有端口），稍后再试");
+    return base + p;
+  };
 
   async function listDrawers() {
     const res = await fetchImpl(`${GATEWAY_BASE}/v1/models`, {
@@ -131,68 +136,31 @@ export function createMagpieImageProvider({ fetchImpl, log = () => {}, warn = ()
     });
   }
 
-  async function saveAnswer(items, ctx) {
-    const dir = String(ctx && ctx.generatedDir ? ctx.generatedDir : "");
-    if (!dir) throw new Error("宿主没给 generatedDir，无法落盘");
-    mkdirSync(dir, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const files = [];
-    let i = 0;
-    for (const it of items) {
-      i += 1;
-      let buf = null;
-      let ext = ".png";
-      const b64 = it && typeof it.b64_json === "string" ? it.b64_json : "";
-      const url = it && typeof it.url === "string" ? it.url : "";
-      if (b64) {
-        buf = Buffer.from(b64, "base64");
-        ext = extOfMime(it.mime_type);
-      } else if (url) {
-        const res = await fetchImpl(url, { timeoutMs: 60_000, maxResponseBytes: 64 * 1024 * 1024 });
-        if (!res.ok) throw new Error(`下载 magpie 给的图片失败：${res.status}`);
-        buf = Buffer.from(await res.arrayBuffer());
-        const ct = typeof res.headers?.get === "function" ? res.headers.get("content-type") : "";
-        ext = extOfMime(ct, extOfUrl(url));
-      }
-      if (!buf || !buf.length) continue;
-      const name = `magpie-${stamp}-${i}${ext}`;
-      writeFileSync(join(dir, name), buf);
-      files.push(name);
-    }
-    return files;
-  }
-
   async function runJob(taskId, body, ctx) {
     try {
-      const res = await fetchImpl(`${GATEWAY_BASE}/v1/images/generations`, {
+      const dataDir = String((ctx && ctx.dataDir) || "");
+      const payload = {
+        ...body,
+        outDir: String((ctx && ctx.generatedDir) || ""),
+        tmpDir: dataDir ? join(dataDir, "tmp", "draw-" + taskId) : "",
+      };
+      const res = await fetchImpl(proxyUrl("/_hana/draw"), {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${DRAW_TOKEN}`,
-          "user-agent": USER_AGENT,
-          accept: "application/json",
-        },
-        body: JSON.stringify(body),
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(payload),
         timeoutMs: DRAW_TIMEOUT_MS,
-        maxResponseBytes: 256 * 1024 * 1024,
+        maxResponseBytes: 1024 * 1024,
       });
       const text = await res.text();
-      if (!res.ok) {
-        let said = text;
-        try {
-          const j = JSON.parse(text);
-          said = j?.error?.message || j?.message || text;
-        } catch { /* 原样 */ }
-        throw new Error(`magpie 生图失败（${res.status}）：${String(said).slice(0, 400)}`);
-      }
       let j = null;
-      try { j = JSON.parse(text); } catch { throw new Error(`magpie 的回包不是 JSON：${text.slice(0, 200)}`); }
-      const items = Array.isArray(j && j.data) ? j.data : [];
-      if (!items.length) throw new Error(`magpie 说成功了但没给图片${j?.text ? `：${String(j.text).slice(0, 200)}` : ""}`);
-      const files = await saveAnswer(items, ctx);
-      if (!files.length) throw new Error("图片拿到了但没能落盘");
+      try { j = JSON.parse(text); } catch { throw new Error(`代理的回包不是 JSON：${String(text).slice(0, 200)}`); }
+      if (!res.ok || !j || j.ok === false) {
+        throw new Error((j && j.error) || `生图失败（HTTP ${res.status}）`);
+      }
+      const files = Array.isArray(j.files) ? j.files : [];
+      if (!files.length) throw new Error("代理说成功了但没给出文件");
       jobs.set(taskId, { status: "success", files, createdAt: Date.now() });
-      log(`生图完成：${body.model} → ${files.join(", ")}`);
+      log(`生图完成：${body.model} → ${files.join(", ")}${j.ms ? `（${(j.ms / 1000).toFixed(1)}s）` : ""}`);
     } catch (e) {
       const message = e && e.message ? String(e.message) : String(e);
       jobs.set(taskId, { status: "failed", failReason: message, createdAt: Date.now() });
@@ -313,9 +281,10 @@ export function createMagpieImageProvider({ fetchImpl, log = () => {}, warn = ()
 
 /** 在 apply 里调一次：把能力来源与适配器交给宿主。
  *  注册本身不需要 magpie 在跑（模型表是刷的时候才去问网关）。 */
-export async function registerMagpieMedia(sdk, { log = () => {}, warn = () => {} } = {}) {
+export async function registerMagpieMedia(sdk, { log = () => {}, warn = () => {}, proxyBase } = {}) {
   const { source, adapter } = createMagpieImageProvider({
     fetchImpl: (url, init) => sdk.network.fetch(url, init),
+    proxyBase,
     log,
     warn,
   });

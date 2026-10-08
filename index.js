@@ -8,6 +8,8 @@
 //   3. 主题：订阅宿主主题 -> 映射成 magpie 的 CSS 变量 -> 推给代理注入
 //   4. 工具 magpie：status / models / quotas / agents / use / start / stop / hidden
 //   5. 生图供应商：把 magpie 网关接成 Hana 的媒体提供方（多媒体里出现 magpie）
+//      出图与下载走本 App 自己的代理进程（runtime/proxy.mjs 的 /_hana/draw），
+//      理由见 media/provider.mjs 的头注释。
 //
 // 红线（见 doc/接手文档.md §4）：
 //   - 不碰用户的 ~/.config/magpie（靠便携 data/ 达成）
@@ -583,7 +585,13 @@ export default defineApp(async (sdk) => {
   // 才去问网关）。具体见 media/provider.mjs 的头注释。
   try {
     const { registerMagpieMedia } = await import("./media/provider.mjs");
-    const media = await registerMagpieMedia(sdk, { log, warn });
+    // proxyBase 传一个取值函数：注册发生在 apply 里，那时代理还没起、端口还是 0。
+    // 真正出图时代理已经就绪，那时再读。
+    const media = await registerMagpieMedia(sdk, {
+      log,
+      warn,
+      proxyBase: () => (state.proxyPort ? `http://127.0.0.1:${state.proxyPort}` : ""),
+    });
     state.mediaProvider = media.providerId;
     state.mediaOk = true;
     log(`生图供应商已注册：provider=${media.providerId} adapter=${media.adapterId}`);
