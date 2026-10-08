@@ -1496,7 +1496,10 @@ const BASE_SHIM = `<script id="hana-base">
 // ── 「从本机导入用量信息」（magepie 设置页 → 同步与备份，最下面一行）──────────────
 // magepie 支持便携目录，所以本 App 带的是第二份 magepie，它的账本从零开始。
 // 这一行就是把它本机那份的第一份 magepie 的历史并过来，任何人装上都能用。
-const IMPORT_CSS = `html:root .hana-import-btn.armed{
+const IMPORT_CSS = `html:root .hana-import-btn{
+  text-align: left;
+}
+html:root .hana-import-btn.armed{
   color: var(--accent, #6b7dff);
 }
 html:root .hana-import-btn:disabled{
@@ -1554,6 +1557,26 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
     b.classList.remove("armed");
   }
 
+  // 跟上面那一排按钮对齐。
+  // magpie 自己的动作列是右对齐的，所以按钮宽度 = 文字宽度（两个字 36px、三个字 45px），
+  // 左边缘自然参差不齐。用户要的是「和上面的按钮左对齐」，所以把宽度撑到与上面那个
+  // 按钮一样（不写死像素：直接量旁边那个真实按钮，这样换字号/缩放/语言都不会跑掉），
+  // 文字改成左对齐，于是字和上面的字从同一个 x 开始。
+  function alignToNeighbour() {
+    var list = el(LIST_ID), row = el(ROW_ID), b = el("hanaImportBtn");
+    if (!list || !row || !b) return;
+    var prev = null;
+    for (var i = 0; i < list.children.length; i++) {
+      var c = list.children[i];
+      if (c === row) break;
+      if (c.querySelector && c.querySelector("button")) prev = c;
+    }
+    var ref = prev ? prev.querySelector("button") : null;
+    if (!ref) return;
+    var w = Math.round(ref.getBoundingClientRect().width);
+    if (w > 0) b.style.minWidth = w + "px";
+  }
+
   function build() {
     var list = el(LIST_ID);
     if (!list) return;
@@ -1564,6 +1587,7 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
       // 用户要的是「最下面一行」，所以发现自己不是队尾就把这两件东西按顺序挪到末尾。
       // 挪完最后一次就不再变化，不会自激。
       if (list.lastElementChild !== n) { list.appendChild(row); list.appendChild(n); }
+      alignToNeighbour();
       return;
     }
     if (!list || el(ROW_ID)) return;
@@ -1599,6 +1623,7 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
     n.hidden = true;
     list.appendChild(row);
     list.appendChild(n);
+    alignToNeighbour();
   }
 
   function describe(rep) {
