@@ -20,12 +20,19 @@
   `const eu = 5e3` —— 实测每次打开都卡在 5.0 秒，一毫秒不差。
   我们这层壳子从来没发过这句话，所以每次都被超时强行擞开。
   下面 sayReady() 就是补上这句话。
+
+  【背景色同样不该自己拍（2026-10-09）】之前这里写死了 #0b0f14，打开时就会
+  闪一下黑。平台的做法是注入主题变量（其它卡片 CSS 就直接写 var(--text, …)），
+  所以这里改成：有变量就用变量，没有就**保持透明**，让卡片自己的底色透出来 ——
+  宁可什么都不画，也不要自己选一个跟主题不对付的颜色。
 -->
 <style>
-  html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
-  #frame { border: 0; width: 100%; height: 100%; display: block; }
-  #msg { color: #8b98a5; font: 13px/1.7 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 18px; }
-  #msg b { color: #c9d4e0; font-weight: 600; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg, var(--hana-bg, transparent));
+    color: var(--text, var(--hana-text, #6b7681)); }
+  #frame { border: 0; width: 100%; height: 100%; display: block; background: transparent; }
+  #msg { font: 13px/1.7 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 18px; }
+  #msg b { font-weight: 600; color: var(--text-strong, var(--text, var(--hana-text, currentColor))); }
 </style>
 </head>
 <body>
@@ -38,6 +45,18 @@
   var frame = document.getElementById("frame");
   var msg = document.getElementById("msg");
   var tries = 0;
+
+  // 主题：平台会把主题变量注入 app 文档（其它卡片 CSS 就直接写 var(--text, …)）。
+  // 这里再把宿主给的变量表（如果有）套到根元素上，抬升优先级；
+  // 拿不到也不自己拍颜色 —— 样式表里的兜底是 transparent。
+  (function applyHostTheme() {
+    var vars = (window.__hanaVars && typeof window.__hanaVars === "object") ? window.__hanaVars : null;
+    if (!vars) return;
+    var root = document.documentElement;
+    Object.keys(vars).forEach(function (k) {
+      try { root.style.setProperty(k, String(vars[k])); } catch (_) {}
+    });
+  })();
 
   // ── 那 5 秒就死在这几行上（2026-10-09）──────────────────────────────
   // 宿主在等卡片文档喊一声「ready」；喊不到就一直等到超时（eu = 5e3）。
