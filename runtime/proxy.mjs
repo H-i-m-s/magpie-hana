@@ -1315,6 +1315,33 @@ function selectBlock() {
   return `<style id="hana-select">\n${SELECT_CSS}</style>\n`;
 }
 
+// 焦点环：点一下某个面板，它就一直带着一圈外框，看着像"选中框"。
+// 来源是 magpie 自己的样式（app.css 里 `button:focus-visible, input:focus-visible
+// { outline: 2px solid var(--accent) }`，以及部分组件用 box-shadow 画的环）。
+// 这里只掐「按钮/可聚焦容器」那一类：input/textarea/select 的焦点环保留，
+// 键盘可用性不受影响。html:root 是为了在特异性上压过 magpie 自己的规则。
+const FOCUS_CSS = `html:root button:focus,
+html:root button:focus-visible,
+html:root a:focus,
+html:root a:focus-visible,
+html:root summary:focus,
+html:root summary:focus-visible,
+html:root [tabindex]:focus,
+html:root [tabindex]:focus-visible,
+html:root canvas:focus,
+html:root canvas:focus-visible {
+  outline: none !important;
+}
+html:root [tabindex]:focus-visible,
+html:root canvas:focus-visible {
+  box-shadow: none !important;
+}
+`;
+
+function focusBlock() {
+  return `<style id="hana-focus">\n${FOCUS_CSS}</style>\n`;
+}
+
 function hiddenBlock() {
   // 选择器必须对真实的 DOM。magpie 的顶部导航是：
   //   <nav class="seg" id="nav"><button data-view="library">…</button></nav>
@@ -1400,6 +1427,36 @@ const BASE_SHIM = `<script id="hana-base">
     report('snapshot', { sheets: sheets, linkCount: links.length, links: links });
   }, 3000);
 
+  // 一次性探针：把"谁带着外框"说清楚，万一上面那条 CSS 没掐干净，
+  // 下次不用再让用户复现一遍。只在页面里观察，不改任何行为。
+  function ringOf(el) {
+    try {
+      var cs = getComputedStyle(el);
+      return {
+        tag: el.tagName,
+        cls: String(el.className || '').slice(0, 80),
+        id: String(el.id || ''),
+        tabindex: String(el.getAttribute('tabindex')),
+        outline: cs.outlineStyle + ' ' + cs.outlineWidth + ' ' + cs.outlineColor,
+        shadow: String(cs.boxShadow || '').slice(0, 90),
+        peers: (function () {
+          try { return [].slice.call(document.querySelectorAll('input,textarea,select')).length; } catch (e) { return -1; }
+        })()
+      };
+    } catch (e) { return { err: String(e && e.message) }; }
+  }
+  try {
+    window.addEventListener('focusin', function (e) {
+      var el = e.target;
+      if (!el || el === document.body) return;
+      report('probe', Object.assign({ probe: 'ring', via: 'focusin' }, ringOf(el)));
+    }, true);
+    setTimeout(function () {
+      var el = document.activeElement;
+      if (el && el !== document.body) report('probe', Object.assign({ probe: 'ring', via: 'active' }, ringOf(el)));
+    }, 1500);
+  } catch (e) {}
+
   if (!base || base === '/') return;
   function fix(u){
     if (typeof u !== 'string' || !u) return u;
@@ -1454,7 +1511,7 @@ function inject(html, vars) {
     else out = seed + out;
   }
   // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
-  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + THEME_CLIENT + SELECT_CLIENT;
+  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + focusBlock() + THEME_CLIENT + SELECT_CLIENT;
   if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
   else out += tail;
   state.rewrites += 1;
