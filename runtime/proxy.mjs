@@ -1493,6 +1493,186 @@ const BASE_SHIM = `<script id="hana-base">
 </script>
 `;
 
+// ── 「从本机导入用量信息」（magepie 设置页 → 同步与备份，最下面一行）──────────────
+// magepie 支持便携目录，所以本 App 带的是第二份 magepie，它的账本从零开始。
+// 这一行就是把它本机那份的第一份 magepie 的历史并过来，任何人装上都能用。
+const IMPORT_CSS = `html:root .hana-import-ctl{
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+html:root .hana-import-btn{
+  height: 26px;
+  padding: 0 12px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--fg, #e8e9ed);
+  background: var(--pill, var(--card, rgba(127, 127, 127, .10)));
+  border: 1px solid var(--line, rgba(127, 127, 127, .28));
+  border-radius: 7px;
+  cursor: default;
+  transition: border-color .15s ease, background .15s ease, color .15s ease;
+}
+html:root .hana-import-btn:hover{
+  border-color: var(--fg-2, var(--muted, #8b8d98));
+}
+html:root .hana-import-btn.armed{
+  border-color: var(--accent, #6b7dff);
+  color: var(--accent, #6b7dff);
+}
+html:root .hana-import-btn:disabled{
+  opacity: .6;
+}
+html:root .hana-import-note{
+  padding: 2px 14px 10px 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fg-2, var(--muted, #8b8d98));
+  white-space: normal;
+}
+html:root .hana-import-note.warn{
+  color: var(--warn, #d8a24a);
+}
+html:root .hana-import-note.bad{
+  color: var(--bad, #d9615e);
+}
+`;
+
+function importBlock() {
+  return `<style id="hana-import">\n${IMPORT_CSS}</style>\n`;
+}
+
+const IMPORT_CLIENT = `<script id="hana-import-client">
+(function(){
+  var BASE = (function(){
+    var p = location.pathname || "/";
+    if (p === "/") return "";
+    return p.charAt(p.length - 1) === "/" ? p.slice(0, -1) : p;
+  })();
+  var ROW_ID = "hanaImportRow";
+  var LIST_ID = "syncList";
+  var busy = false;
+  var armed = false;
+
+  function report(kind, extra) {
+    try { if (typeof window.__hanaDiag === "function") window.__hanaDiag(kind, extra || {}); } catch (e) {}
+  }
+  function el(id) { return document.getElementById(id); }
+  function note(text, tone) {
+    var n = el("hanaImportNote");
+    if (!n) return;
+    if (!text) { n.hidden = true; n.textContent = ""; return; }
+    n.hidden = false;
+    n.textContent = text;
+    n.className = "hana-import-note" + (tone ? " " + tone : "");
+  }
+  function reset() {
+    armed = false;
+    var b = el("hanaImportBtn");
+    if (!b) return;
+    b.disabled = false;
+    b.textContent = "导入";
+    b.classList.remove("armed");
+  }
+
+  function build() {
+    var list = el(LIST_ID);
+    if (!list) return;
+    var row = el(ROW_ID);
+    var n = el("hanaImportNote");
+    if (row && n) {
+      // magpie 自己的那几行是异步渲染的，可能落在我们后面（实测就是这样）。
+      // 用户要的是「最下面一行」，所以发现自己不是队尾就把这两件东西按顺序挪到末尾。
+      // 挪完最后一次就不再变化，不会自激。
+      if (list.lastElementChild !== n) { list.appendChild(row); list.appendChild(n); }
+      return;
+    }
+    if (!list || el(ROW_ID)) return;
+    var row = document.createElement("div");
+    row.className = "row pref";
+    row.id = ROW_ID;
+    var who = document.createElement("div");
+    who.className = "who";
+    var name = document.createElement("div");
+    name.className = "name";
+    name.textContent = "从本机导入用量信息";
+    var sub = document.createElement("div");
+    sub.className = "sub";
+    sub.textContent = "这台机器上如果还有另一份 magpie（如 ~/.config/magpie），把它的用量、配额与路由记录并进这里。可以反复导入，重复的不会算两遍。导入时 magpie 会重启一次，正在跑的请求会中断。";
+    who.appendChild(name);
+    who.appendChild(sub);
+    var ctl = document.createElement("div");
+    ctl.className = "hana-import-ctl";
+    var b = document.createElement("button");
+    b.type = "button";
+    b.id = "hanaImportBtn";
+    b.className = "hana-import-btn";
+    b.textContent = "导入";
+    b.onclick = onClick;
+    ctl.appendChild(b);
+    row.appendChild(who);
+    row.appendChild(ctl);
+    var n = document.createElement("div");
+    n.id = "hanaImportNote";
+    n.className = "hana-import-note";
+    n.hidden = true;
+    list.appendChild(row);
+    list.appendChild(n);
+  }
+
+  function describe(rep) {
+    if (!rep) return "导入完成。";
+    var parts = [];
+    var files = rep.files || [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      if (f.added > 0) parts.push(f.name.replace("routing/", "路由 ") + " +" + f.added);
+    }
+    if (!parts.length) return "本机那份没有这里还缺的记录，没有变化。";
+    return "已并入：" + parts.join("、") + "。原样备份留在 App 数据目录的 import-backup 下。";
+  }
+
+  async function onClick() {
+    if (busy) return;
+    if (!armed) {
+      armed = true;
+      var b0 = el("hanaImportBtn");
+      if (b0) { b0.textContent = "确认导入（会重启 magpie）"; b0.classList.add("armed"); }
+      note("再点一次就开始。导入会先停 magpie，并完再起，中间几秒它在休息。", "warn");
+      return;
+    }
+    busy = true;
+    var b1 = el("hanaImportBtn");
+    if (b1) { b1.disabled = true; b1.textContent = "导入中…"; }
+    note("正在导入，magpie 会短暂重启…", "warn");
+    report("import-usage-start", {});
+    try {
+      var res = await fetch(BASE + "/_hana/import-usage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apply: true })
+      });
+      var j = await res.json();
+      if (!res.ok || !j || j.ok === false) throw new Error((j && j.error) || ("HTTP " + res.status));
+      note(describe(j.report) + " 回到「额度」页刷新一下就能看到。", null);
+    } catch (e) {
+      note("导入失败：" + String((e && e.message) || e), "bad");
+    } finally {
+      busy = false;
+      reset();
+      report("import-usage-done", {});
+    }
+  }
+
+  build();
+  if (window.MutationObserver) {
+    new MutationObserver(function(){ build(); }).observe(document.documentElement, { childList: true, subtree: true });
+  }
+})();
+</script>
+`;
+
 function inject(html, vars) {
   let out = html;
   // 主题选择的初始值 + 服务端备好的变量表，直接写进页面。
@@ -1511,7 +1691,7 @@ function inject(html, vars) {
     else out = seed + out;
   }
   // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
-  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + focusBlock() + THEME_CLIENT + SELECT_CLIENT;
+  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + focusBlock() + importBlock() + THEME_CLIENT + SELECT_CLIENT + IMPORT_CLIENT;
   if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
   else out += tail;
   state.rewrites += 1;
@@ -2093,6 +2273,49 @@ async function handleInternal(req, res) {
       return sendJson(res, out, out.ok ? 200 : 502);
     } catch (e) {
       return sendJson(res, { ok: false, error: String((e && e.message) || e) }, 502);
+    }
+  }
+
+  // 「从本机导入用量信息」（magepie 设置页 → 同步与备份最下面那一行调的）。
+  // 先停 magpie：这些表它在内存里也存着一份，不停就白改；并完再起回来。
+  if (path === "/_hana/import-usage" && req.method === "POST") {
+    if (state.importing) return sendJson(res, { ok: false, error: "已经在导入了，等这次结束再点" }, 409);
+    const b = await readJson(req);
+    const apply = b.apply === true;
+    state.importing = true;
+    try {
+      const home = join(state.exeCwd || process.cwd(), "data");
+      const mod = await import("./import-usage.mjs");
+      const found = mod.findSource(home, realUserEnv() || {});
+      if (!found.length) {
+        return sendJson(res, {
+          ok: false,
+          error: "本机没找到另一份 magpie 的家目录（找过 ~/.config/magpie、%APPDATA%\\magpie、%LOCALAPPDATA%\\magpie、~/.magpie）。"
+            + "本 App 用的是便携目录，不在那几个位置；如果你确实还有一份装在别处，把它告诉我。",
+        }, 404);
+      }
+      const src = found[0].dir;
+      if (!apply) {
+        const rep = mod.importUsage({ srcDir: src, homeDir: home, apply: false, log: (m) => log("（演练）" + m) });
+        return sendJson(res, { ok: true, dry: true, report: rep });
+      }
+      const wasRunning = !!(state.magpiePid && pidAlive(state.magpiePid));
+      log(`导入用量：${src} → ${home}（先停 magpie）`);
+      stopMagpie();
+      await new Promise((r) => setTimeout(r, 1200));
+      let rep = null;
+      let bad = null;
+      try { rep = mod.importUsage({ srcDir: src, homeDir: home, apply: true, log }); }
+      catch (e) { bad = e; }
+      clearGetCache("导入用量后");
+      if (wasRunning) await startMagpie({ exe: state.exePath, cwd: state.exeCwd });
+      if (bad) return sendJson(res, { ok: false, error: String((bad && bad.message) || bad) }, 500);
+      log(`导入完成：新增 ${rep.added} 条，备份 ${rep.backup}`);
+      return sendJson(res, { ok: true, report: rep });
+    } catch (e) {
+      return sendJson(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    } finally {
+      state.importing = false;
     }
   }
 

@@ -436,6 +436,27 @@ export default defineApp(async (sdk) => {
     return actStatus();
   }
 
+  // 工具路径专用的起法。
+  // 为什么不能直接 await：工具请求来自模型循环（走 tool-call 那一帧），宿主会把当次调用
+  // 的 callToken/taskId 一并塞进 runtime 启动参数，而 local-machine profile 明确拒收这些
+  // 字段，实测原文：
+  //   Local-machine execution does not accept readRoots, writeRoots, callToken, or taskId scope inputs.
+  // （apply 里和卡片/路由那条路上的启动没有调用令牌，一直没事；只有工具这条路会撞上。）
+  // 所以把启动挪到这一帧之外再发起：工具立刻回「已安排」，之后用 status 看真实结果。
+  function actStartDeferred() {
+    if (state.phase === "ready" && state.proxyPort) {
+      return { text: "托管的 magpie 已经在跑。", data: { phase: state.phase, scheduled: false } };
+    }
+    const t = setTimeout(() => {
+      ensureStarted().catch((e) => err(`后台启动失败：${msgOf(e)}`));
+    }, 500);
+    if (t && typeof t.unref === "function") t.unref();
+    return {
+      text: "已安排启动托管的 magpie（正常几秒内就绪，冷启动可能要十几秒），稍后用 action=status 看结果。",
+      data: { phase: state.phase, scheduled: true },
+    };
+  }
+
   async function actStop() {
     await stopRuntime();
     return { text: "托管的 magpie 已停止。", data: { phase: state.phase } };
@@ -493,7 +514,7 @@ export default defineApp(async (sdk) => {
             case "quotas": out = await actQuotas(); break;
             case "agents": out = await actAgents(); break;
             case "use": out = { text: "请在 Magpie 工作区里选择模型（或使用 magpie 自身的 CLI）。", data: {} }; break;
-            case "start": out = await actStart(); break;
+            case "start": out = await actStartDeferred(); break;
             case "stop": out = await actStop(); break;
             case "hidden": out = await actHidden(args); break;
             case "update-check": out = await actUpdateCheck(); break;
