@@ -4,21 +4,22 @@
 <meta charset="utf-8">
 <title>Magpie</title>
 <!--
-  这层壳为什么存在（2026-10-08）：
+  这层壳为什么存在（2026-10-08），以及那 5 秒到底是什么（2026-10-09）：
 
-  Hana 的卡片分两种。route 型的文档由 Hana 自己的 app-host 伺服，宿主与文档之间的
-  「可信握手」瞬间完成，卡片秒开（图库、token-tracker 就是这样）。service 型的
-  文档来自 App 自己的服务（我们原来是这种），而那个握手只认 Hana 自己签发的文档：
-  宿主发 chrome-challenge、等文档回话，magpie 的页面当然不会回，于是**每次打开都要
-  等超时才放行**——实测 5 秒左右，页面本身只要 0.2 秒。
+  【为什么是壳】Hana 的卡片分两种。route 型的文档由 Hana 自己的 app-host 伺服，
+  service 型的文档来自 App 自己的服务（我们原来是这种）。所以改成 route 型：这张由
+  Hana 伺服的小页面在同一个源里，它再把真正的 magpie 界面放进一个 iframe。
+  内嵌 127.0.0.1 的权限在 manifest 的 ui.csp.frameDomains 里声明（CSP 里
+  http://127.0.0.1 不带端口即匹配任意端口），代理端口是每次启动随机挑的，只能这样声明。
+  壳子还兼一个桥：主题选择的持久化要落到 App 的路由，那个地址和 iframe 不同源，由这里代转。
 
-  所以这里改成 route 型：这张由 Hana 伺服的小页面负责握手（瞬间完成），它再把真正的
-  magpie 界面放进一个 iframe。内嵌 127.0.0.1 的权限在 manifest 的 ui.csp.frameDomains
-  里声明（CSP 里 http://127.0.0.1 不带端口即匹配任意端口），代理端口是每次启动随机挑的，
-  所以只能这样声明。
-
-  壳子还兼一个桥：主题选择的持久化要落到 App 的路由（ui.json 的唯一写入方），那个地址
-  和 iframe 不同源，所以由这里代转。
+  【那 5 秒】它不是握手等的，而是**我们在等宿主，宿主也在等我们**：
+  卡片 iframe 一直在 DOM 里，只是 opacity:0；宿主等的是卡片文档自己 postMessage
+  一个 ready 信封（PlanModeButton 里的 Qc()：无 protocol 的 {type:"ready"}，
+  或带 protocol 的 {type:"hana.ready"}）。等不到就走超时，而那个常量正好是
+  `const eu = 5e3` —— 实测每次打开都卡在 5.0 秒，一毫秒不差。
+  我们这层壳子从来没发过这句话，所以每次都被超时强行擞开。
+  下面 sayReady() 就是补上这句话。
 -->
 <style>
   html, body { margin: 0; height: 100%; background: #0b0f14; overflow: hidden; }
@@ -37,6 +38,17 @@
   var frame = document.getElementById("frame");
   var msg = document.getElementById("msg");
   var tries = 0;
+
+  // ── 那 5 秒就死在这几行上（2026-10-09）──────────────────────────────
+  // 宿主在等卡片文档喊一声「ready」；喊不到就一直等到超时（eu = 5e3）。
+  // 我们以前从没喊过，所以每次都被超时擞开。
+  // 一进文档就喊，并补喊几次（防宿主监听晚一步）；喊完遮罩立刻抬起，
+  // 用户看到的是下面那句「正在连接 magpie…」，而不是 5 秒转圈。
+  function sayReady() {
+    try { window.parent.postMessage({ type: "ready" }, "*"); } catch (_) {}
+  }
+  sayReady();
+  [60, 300, 1000].forEach(function (d) { setTimeout(sayReady, d); });
 
   function show(text) {
     msg.innerHTML = text;
@@ -138,7 +150,9 @@
   }
 
   // 主题选择的持久化：iframe 里的页面把选择发过来，这里落到 App 路由。
-  frame.addEventListener("load", function () { postTiming("frame-loaded"); });  window.addEventListener("message", function (e) {
+  frame.addEventListener("load", function () { postTiming("frame-loaded"); });
+
+  window.addEventListener("message", function (e) {
     var d = e.data;
     if (!d || d.type !== "magpie-hana:choice") return;
     fetch(ABS + "/theme", {
