@@ -212,8 +212,8 @@
   <div class="card">
     <div class="row">
       <div class="who">
-        <div class="name">工作区里隐藏的功能</div>
-        <div class="desc">只隐藏入口，不解除底层能力。改动立即生效，重新打开工作区即可看到。</div>
+        <div class="name">工作区里的功能</div>
+        <div class="desc">开关表示这个功能是否出现在工作区里：开着 = 显示中，关掉 = 隐藏入口（只隐藏入口，不解除底层能力）。改动立即生效，重新打开工作区即可看到。</div>
       </div>
     </div>
     <div id="hiddenList"></div>
@@ -462,18 +462,22 @@
         right.className = 'feat__right';
         const state = document.createElement('span');
         state.className = 'feat__state';
-        const on = hidden.includes(f.id);
-        state.textContent = on ? '已隐藏' : '显示中';
+        const isHidden = hidden.includes(f.id);
+        state.textContent = isHidden ? '已隐藏' : '显示中';
 
         const sw = document.createElement('button');
         sw.className = 'hana-toggle';
         sw.type = 'button';
         sw.setAttribute('role', 'switch');
         sw.setAttribute('aria-label', f.label);
-        if (on) sw.setAttribute('data-checked', '');
-        sw.setAttribute('aria-checked', on ? 'true' : 'false');
+        // 开关表达的是「这个功能开着吗」，不是「它被隐藏了吗」。
+        // hana-toggle 是 Hana 的统一开关：data-checked = 开（点亮 + 滑块右移），
+        // 没有这个属性 = 关（灰、滑块在左）。所以它必须跟着 !hidden 走 ——
+        // 之前反着喂，才会出现「已隐藏」看着像开着。
+        if (!isHidden) sw.setAttribute('data-checked', '');
+        sw.setAttribute('aria-checked', isHidden ? 'false' : 'true');
         sw.addEventListener('click', async () => {
-          hidden = on ? hidden.filter((x) => x !== f.id) : [...hidden, f.id];
+          hidden = isHidden ? hidden.filter((x) => x !== f.id) : [...hidden, f.id];
           await api(`${ROUTE}/hidden`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
