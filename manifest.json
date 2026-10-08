@@ -46,16 +46,6 @@
         "face": {
           "image": "assets/cover.svg"
         }
-      },
-      {
-        "id": "ping",
-        "title": "Magpie 诊断卡",
-        "description": "一张只写一行字的对照组卡片：用来判断那 5 秒是出在这个 App 的卡片实体上，还是出在 magpie 那张卡的内嵌壳子上。诊断完就删。",
-        "cardForm": "flush",
-        "route": "/ping.html",
-        "face": {
-          "image": "assets/cover.svg"
-        }
       }
     ],
     "settings": {
