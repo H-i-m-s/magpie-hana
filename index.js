@@ -7,6 +7,7 @@
 //      —— 代理与 magpie 同在一个 job object，Hana 一停整体回收
 //   3. 主题：订阅宿主主题 -> 映射成 magpie 的 CSS 变量 -> 推给代理注入
 //   4. 工具 magpie：status / models / quotas / agents / use / start / stop / hidden
+//   5. 生图供应商：把 magpie 网关接成 Hana 的媒体提供方（多媒体里出现 magpie）
 //
 // 红线（见 doc/接手文档.md §4）：
 //   - 不碰用户的 ~/.config/magpie（靠便携 data/ 达成）
@@ -21,7 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_ID = "magpie-hana";
-const APP_VERSION = "0.5.1";
+const APP_VERSION = "0.5.2";
 
 const PROXY_ENTRY = "runtime/proxy.mjs";
 const VENDOR_EXE = "vendor/magpie-windows-amd64.exe";
@@ -71,6 +72,9 @@ export default defineApp(async (sdk) => {
     themeChoice: "auto",     // 主题：auto（跟随 Hana）| 具体主题名
     hidden: ["library", "sessions"],
     seeding: null,
+    mediaOk: null,           // 生图供应商注册结果（null = 还没跑）
+    mediaProvider: "",
+    mediaError: "",
   };
   {
     const ui = readUi();
@@ -533,6 +537,7 @@ export default defineApp(async (sdk) => {
               bun: !!plug.bun, bunVersion: plug.bunVersion || "",
               mirror: !!plug.mirror, count: (plug.plugins || []).length,
             } : null,
+            media: { ok: state.mediaOk, providerId: state.mediaProvider, error: state.mediaError },
           });
         } catch (e) { return c.json({ ok: false, error: msgOf(e) }, 500); }
       });
@@ -570,6 +575,23 @@ export default defineApp(async (sdk) => {
     log("路由已注册");
   } catch (e) {
     err(`注册路由失败：${msgOf(e)}`);
+  }
+
+  // ── 生图供应商（app/media.provide）────────────────────────────────────────
+  // 把 magpie 网关接成 Hana 的媒体提供方：装完就在「多媒体」里出现一个叫 magpie 的
+  // 供应商，模型表跟着网关里会画的模型走。注册本身不需要 magpie 在跑（刷模型表时
+  // 才去问网关）。具体见 media/provider.mjs 的头注释。
+  try {
+    const { registerMagpieMedia } = await import("./media/provider.mjs");
+    const media = await registerMagpieMedia(sdk, { log, warn });
+    state.mediaProvider = media.providerId;
+    state.mediaOk = true;
+    log(`生图供应商已注册：provider=${media.providerId} adapter=${media.adapterId}`);
+  } catch (e) {
+    state.mediaOk = false;
+    state.mediaError = msgOf(e);
+    err(`生图供应商注册失败：${msgOf(e)}`
+      + "（若是权限没给：设置 → 应用 → 应用能力 里打开 app/media.provide 后重载）");
   }
 
   // ── 启动 ──────────────────────────────────────────────────────────────────
