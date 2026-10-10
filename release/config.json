@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+
+  "publisher": "H-i-M-s",
+  "defaultBranch": "master",
+
+  "release": {
+    "repo": "H-i-M-s/magpie-hana"
+  },
+
+  "pack": {
+    "out": "dist",
+    "excludeDirs": [
+      ".git",
+      ".github",
+      "node_modules",
+      "dist",
+      "release",
+      "doc",
+      "scripts",
+      "tools"
+    ],
+    "excludeNames": [".DS_Store", "Thumbs.db", "desktop.ini"],
+    "excludePrefixes": ["._"],
+    "excludeExtensions": ["tmp", "temp", "swp", "swo", "log", "bak"],
+    "excludeSuffixes": ["~"],
+    "selfcheck": "required"
+  }
+}

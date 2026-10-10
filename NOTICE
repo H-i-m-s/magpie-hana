@@ -30,3 +30,29 @@ MIT 明确允许复制、发布、再授权与销售，唯一义务是保留版�
   ui/assets/app-ui.js.LEGAL.txt
   ui/assets/THIRD_PARTY_NOTICES.txt
   sdk/THIRD_PARTY_NOTICES.txt
+
+## release/ 下的发布工具链
+
+`release/` 下的出包 / 发版 / 投稿工具链整体取自同作者的 git-save-load
+（https://github.com/H-i-M-s/git-save-load），那份以 MPL-2.0 授权。
+以下九个文件逐字复制、未作修改（已用 sha256 逐个核对）：
+
+  发布.cmd   ship.ps1   publish.mjs   market.mjs   pack.mjs   exec.mjs   console.mjs
+  投稿规范.md   pr-assets/README.md
+
+其中 pack.mjs 的大部分内容与 selfcheck.mjs 的部分实现衍生自 GitHana
+（Copyright (c) 2026 Nyasers，MPL-2.0，https://github.com/Nyasers/GitHana），
+这两个文件的修改后版本同样以 MPL-2.0 发布。
+
+以下三个文件为插件专属，不属于逐字复制：
+
+  release/config.json     发布身份与打包范围，按本仓库的目录结构写
+  release/selfcheck.mjs   检查项按本插件重写（结构与部分实现取自 git-save-load 的同名文件）
+  release/自测.md         自测报告模板，按本 App 的情形写
+
+以上来自 git-save-load 的文件及其修改后版本同为 MPL-2.0；本 App 其余部分为 MIT。
+两套许可各自生效，互不改变对方。MPL-2.0 以文件为单位，只覆盖上列那部分文件。
+它们只在开发期由 `node release/*.mjs` 执行，不进安装包
+（`release` 在 release/config.json 的 pack.excludeDirs 里），因此分发出去的归档仍是纯 MIT。
+它们的 Source Code Form 可从本仓库获取：
+https://github.com/H-i-M-s/magpie-hana
