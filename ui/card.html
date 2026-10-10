@@ -10,8 +10,13 @@
   service 型的文档来自 App 自己的服务（我们原来是这种）。所以改成 route 型：这张由
   Hana 伺服的小页面在同一个源里，它再把真正的 magpie 界面放进一个 iframe。
   内嵌 127.0.0.1 的权限在 manifest 的 ui.csp.frameDomains 里声明（CSP 里
-  http://127.0.0.1 不带端口即匹配任意端口），代理端口是每次启动随机挑的，只能这样声明。
+  http://127.0.0.1 不带端口即匹配任意端口，所以端口怎么变都不用改这里）。
   壳子还兼一个桥：主题选择的持久化要落到 App 的路由，那个地址和 iframe 不同源，由这里代转。
+
+  【为什么把上次那一页拼进地址（2026-10-10）】magpie 的当前页只写在地址栏的
+  ?view= 上（它自己不往存储里记），而卡片是一个每次打开都新起的 iframe ——
+  地址栏那点东西随 iframe 一起没。代理进程把「上次停在哪一页」落了盘，
+  App 的 /status 把它一并给我们，这里负责拼回 iframe 地址。
 
   【那 5 秒】它不是握手等的，而是**我们在等宿主，宿主也在等我们**：
   卡片 iframe 一直在 DOM 里，只是 opacity:0；宿主等的是卡片文档自己 postMessage
@@ -85,7 +90,14 @@
           setTimeout(connect, 1200);
           return;
         }
-        frame.src = "http://127.0.0.1:" + port + "/?shellT0=" + T0;
+        // 上次停在哪一页（代理记的，App 的 /status 转给我们）。
+        // 认不出的值一律不拼，退回 magpie 自己的默认首屏；agents 是它的默认，
+        // 也不必在地址里显形（app.js 自己就是「view=agents 就不写这个参数」）。
+        var VIEWS = ["providers", "gateway", "routing", "usage", "sessions", "library", "plugins", "settings"];
+        var view = j && typeof j.view === "string" ? j.view : "";
+        var query = "?shellT0=" + T0;
+        if (VIEWS.indexOf(view) >= 0) query += "&view=" + encodeURIComponent(view);
+        frame.src = "http://127.0.0.1:" + port + "/" + query;
         frame.style.display = "block";
         msg.style.display = "none";
         postTiming("src-set");

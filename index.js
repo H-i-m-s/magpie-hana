@@ -56,6 +56,9 @@ export default defineApp(async (sdk) => {
   const magpieDataDir = join(binDir, "data");
   const runtimeFile = join(dataDir, "runtime.json");
   const uiFile = join(dataDir, "ui.json");
+  // 上次停在 magpie 的哪一页。这份记录由代理进程（runtime/proxy.mjs）写，
+  // 它与 App 共用同一个 dataDir（代理的 cwd 就是这个目录）。
+  const viewFile = join(dataDir, "view.json");
 
   log(`apply | dataDir=${dataDir} | appRoot=${appRoot} | v${APP_VERSION}`);
 
@@ -73,6 +76,7 @@ export default defineApp(async (sdk) => {
     themeAttr: "",
     themeChoice: "auto",     // 主题：auto（跟随 Hana）| 具体主题名
     hidden: ["library", "sessions"],
+    view: "",                // 上次停在 magpie 的哪一页（由代理落盘，见 runtime/proxy.mjs）
     seeding: null,
     mediaOk: null,           // 生图供应商注册结果（null = 还没跑）
     mediaProvider: "",
@@ -82,6 +86,7 @@ export default defineApp(async (sdk) => {
     const ui = readUi();
     state.hidden = ui.hidden;
     state.themeChoice = ui.theme;
+    state.view = readSavedView();
   }
 
   function readUi() {
@@ -169,7 +174,7 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 启动代理（它内部会拉起 magpie web）───────────────────────────────────
-  async function startOnce(attempt) {
+  async function startOnce(attempt, reusePort = false) {
     if (!sdk.runtime || typeof sdk.runtime.start !== "function") {
       throw new Error("宿主 ctx.runtime 不可用（app/runtime.execute 未授予或宿主过旧）");
     }
@@ -179,10 +184,11 @@ export default defineApp(async (sdk) => {
     seedExe();
     mkdirSync(magpieDataDir, { recursive: true });
 
-    const port = 41000 + Math.floor(Math.random() * 8000);
+    const port = pickProxyPort(reusePort);
+    const lastView = state.view || readSavedView();
     const readyMarker = "MAGPIE_HANA_READY:" + randomBytes(16).toString("base64url");
 
-    log(`启动受管 runtime（attempt ${attempt}，代理端口 ${port}）`);
+    log(`启动受管 runtime（attempt ${attempt}，代理端口 ${port}${reusePort ? "，延用上次的" : ""}）`);
     let rt;
     try {
       rt = await sdk.runtime.start({
@@ -198,6 +204,7 @@ export default defineApp(async (sdk) => {
           `--marker=${readyMarker}`,
           `--hidden=${state.hidden.join(",")}`,
           `--theme=${state.themeChoice || "auto"}`,
+          `--view=${lastView}`,
         ],
         service: { id: SERVICE_ID, port, readyMarker },
       });
@@ -215,7 +222,20 @@ export default defineApp(async (sdk) => {
     // 等代理就绪 + 上游 magpie 就绪
     const deadline = Date.now() + READY_MAX_MS;
     let lastProbeErr = null;
+    let tick = 0;
     while (Date.now() < deadline) {
+      // 代理自己没监听起来（比如端口被占）会立刻退场，退场码 7 是这套约定里的
+      // 「端口被占」（见 proxy.mjs）。不在这里早退的话，就得干等满 90 秒超时。
+      if (++tick % 4 === 0) {
+        const ex = await runtimeExitInfo();
+        if (ex) {
+          const e = new Error(ex.exitCode === 7
+            ? `代理端口被占用（退出码 7）`
+            : `代理进程已退出（state=${ex.state} exitCode=${ex.exitCode}）`);
+          e.code = ex.exitCode === 7 ? "port-busy" : "proxy-exited";
+          throw e;
+        }
+      }
       try {
         const st = await proxyJson("/_hana/status");
         state.upstreamPort = st.upstreamPort || 0;
@@ -236,6 +256,7 @@ export default defineApp(async (sdk) => {
         const m = msgOf(e);
         // 上游自己的错误（magpie 崩了）就直接放弃，不要空等
         if (/magpie 启动失败|magpie 退出|spawn 失败|可执行文件不存在/.test(m)) throw e;
+        if (e && (e.code === "port-busy" || e.code === "proxy-exited")) throw e;
         lastProbeErr = m;  // 代理还没起来，继续等
       }
       await sleep(READY_POLL_MS);
@@ -256,20 +277,87 @@ export default defineApp(async (sdk) => {
     } catch { /* 忽略 */ }
   }
 
+  // 上次运行留下的端口/上次停在哪一页。读失败一律当「没记过」。
+  function readRuntime() {
+    try {
+      if (!existsSync(runtimeFile)) return {};
+      return JSON.parse(readFileSync(runtimeFile, "utf8")) || {};
+    } catch { return {}; }
+  }
+
+  // 上次停在的页（代理落盘的那份）。空串 = 还没记过。
+  function readSavedView() {
+    try {
+      if (!existsSync(viewFile)) return "";
+      const j = JSON.parse(readFileSync(viewFile, "utf8"));
+      const v = j && j.view;
+      return typeof v === "string" ? v : "";
+    } catch { return ""; }
+  }
+
+  // ── 代理端口为什么要跨重启钉住（2026-10-10）─────────────────────────────
+  // 卡片里的 magpie 是从 iframe 直连代理的 http://127.0.0.1:<port>，而浏览器
+  // 按「源」隔离 localStorage。端口每次随机 = 每次打开卡片都是一个全新的源，
+  // magpie 自己记的那些页内偏好（用量子页、设置分区、排序、折叠……它写了
+  // 二十多处 localStorage）就永远读不回来。
+  // 用回同一个端口 = 同一个源，它自己的记忆就活了；上游端口同理（见
+  // proxy.mjs 的钉端口注释）。
+  //
+  // 【谁来判断端口空不空（2026-10-10，踩过坑）】
+  // 一开始这里自己用 net.createServer().listen() 去探端口，App 进程直接报
+  // ERR_ACCESS_DENIED（at createServerHandle / Server.setupListenHandle）——
+  // v2 App 自己的进程跑在 Node 权限模型下，**不允许监听端口**
+  // （见 sdk/app-process-capabilities.js；监听是子进程的权利）。
+  // 所以 App 只做「声明」：把想用的端口交给代理去绑；绑不上时代理以退出码 7
+  // 回话（见 proxy.mjs 的 server.on("error")），这里再换一个重试。
+  // 这也是本仓已有的先例：comfyui-hana 的 port-busy / exitCode 7 同一套。
+  function pickProxyPort(reuse) {
+    const prev = Number(readRuntime().proxyPort) || 0;
+    if (reuse && prev) return prev;
+    return 41000 + Math.floor(Math.random() * 8000);
+  }
+
+  // 代理是不是已经退场了、退场码是多少。读不到就返回 null（当作「还不知道」）。
+  async function runtimeExitInfo() {
+    try {
+      if (!state.runtimeId || typeof sdk.runtime?.get !== "function") return null;
+      const info = await sdk.runtime.get(state.runtimeId);
+      if (!info) return null;
+      if (info.state === "exited" || info.state === "failed" || info.state === "stopped") {
+        return { state: info.state, exitCode: typeof info.exitCode === "number" ? info.exitCode : null };
+      }
+      return null;
+    } catch { return null; }
+  }
+
   async function ensureStarted() {
     if (state.phase === "ready") return true;
     if (state.startPromise) return state.startPromise;
     state.phase = "starting";
     state.startPromise = (async () => {
       let last = null;
+      // reusePort：第一次试「上次那个端口」（为了稳定的源），之后一律换新的。
+      // portBusyLeft：换端口重来的预算。它与「启动重试」是两回事：
+      //   端口被占是环境问题，换个端口就好，不计入退避重试；
+      //   但也不能无上限，免得在一个抢不到的端口段里转圈。
+      let reusePort = true;
+      let portBusyLeft = 3;
       for (let i = 0; i < RETRY_DELAYS_MS.length + 1; i++) {
         try {
-          await startOnce(i + 1);
+          await startOnce(i + 1, reusePort);
           return true;
         } catch (e) {
           last = e;
           state.lastError = msgOf(e);
           err(`启动失败（第 ${i + 1} 次）：${state.lastError}`);
+          reusePort = false;   // 反正接下来一定换端口
+          if (e && e.code === "port-busy" && portBusyLeft > 0) {
+            portBusyLeft -= 1;
+            log(`上次那个端口被占了，换个端口重试（这一趟会是新的源，magpie 自己的记忆这一轮读不回来）`);
+            i -= 1;   // 不消耗退避重试次数：这是环境问题，不是我们的毛病
+            await sleep(300);
+            continue;
+          }
           if (i < RETRY_DELAYS_MS.length) await sleep(RETRY_DELAYS_MS[i]);
         }
       }
@@ -344,6 +432,7 @@ export default defineApp(async (sdk) => {
       `只读缓存：${proxy?.cache ? `${proxy.cache.entries} 条在缓 / 命中 ${proxy.cache.hit}，过期回源 ${proxy.cache.stale}（后台刷新 ${proxy.cache.refresh}），因写入作废 ${proxy.cache.cleared} 次，首次回源 ${proxy.cache.miss}` : "—"}`,
       `magpie 进程：${state.magpiePid || proxy?.magpiePid || "—"}`,
       `隐藏的功能：${state.hidden.join(", ") || "（无）"}`,
+      `记住的页面：${proxy?.view || readSavedView() || "（还没记过）"}`,
     ];
     if (state.lastError) lines.push(`最近错误：${state.lastError}`);
     return { text: lines.join("\n"), data: { phase: state.phase, proxy, gateway: up } };
@@ -552,6 +641,7 @@ export default defineApp(async (sdk) => {
           return c.json({
             ok: true, app: { id: APP_ID, version: APP_VERSION },
             phase: state.phase, proxyPort: state.proxyPort,
+            view: live?.view || readSavedView() || "",
             upstreamPort: live?.upstreamPort || state.upstreamPort,
             magpiePid: live?.magpiePid || state.magpiePid, magpieVersion: state.magpieVersion,
             lastError: state.lastError, hidden: state.hidden, theme: state.themeChoice,

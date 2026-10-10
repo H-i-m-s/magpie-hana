@@ -119,6 +119,7 @@ const state = {
   themeCss: "",
   serverTheme: "",       // Hana 当前主题名（服务端从 preferences.json 读，作 auto 的兜底）
   themeApplied: "",      // 实际生效的主题（诊断用）
+  view: "",              // 上次停在 magpie 的哪一页（agents/providers/usage/…）
   lastError: null,
   phase: "starting",   // starting | waiting-magpie | ready | error | stopping
   requests: 0,
@@ -224,6 +225,39 @@ function fetchThemeCss(name) {
 }
 
 const log = (m) => process.stderr.write(`[magpie-hana] ${m}\n`);
+
+// ── 「停在哪一页」的持久化 ────────────────────────────────────────────────────
+// 为什么这件事要落在代理上、而不是页面自己：
+//   magpie 的当前页只活在地址栏的 ?view= 上（app.js 的 show() 改完页面就
+//   history.replaceState 写回 URL），它自己不往任何存储里记。而卡片是一个
+//   每次打开都新起的 iframe，地址栏那点东西随 iframe 一起没了。
+//   代理进程活得更久、又有个稳定的数据目录（cwd = app-data/magpie-hana），
+//   所以由它记：页面换页时上报，卡片壳下次打开时把它拼回 iframe 地址。
+// 只有真正的「窗口」形态才有页签（mode=panel 是托盘面板），所以只认 window。
+const VIEW_FILE = "view.json";
+const VIEW_NAMES = ["agents", "providers", "gateway", "routing", "usage", "sessions", "library", "plugins", "settings"];
+
+function validView(v) {
+  return typeof v === "string" && VIEW_NAMES.includes(v) ? v : "";
+}
+
+function readView() {
+  try {
+    const f = join(process.cwd(), VIEW_FILE);
+    if (!existsSync(f)) return "";
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    return validView(j && j.view);
+  } catch { return ""; }
+}
+
+function saveView(v) {
+  const ok = validView(v);
+  if (!ok) return;
+  try {
+    writeFileSync(join(process.cwd(), VIEW_FILE),
+      JSON.stringify({ view: ok, updatedAt: new Date().toISOString() }, null, 2), "utf8");
+  } catch (e) { log("保存 view.json 失败：" + (e && e.message ? e.message : String(e))); }
+}
 
 // ── 主题：把「Hana 的配色」注入 magpie，但不夺走它自己的开关 ───────────
 //
@@ -1678,6 +1712,105 @@ const IMPORT_CLIENT = `<script id="hana-import-client">
 </script>
 `;
 
+// 页面里跑的「换页上报」。装在 </head> 之前，早于 app.js，所以能先包住
+// history.replaceState —— app.js 换页最后一步就是它。
+const VIEW_CLIENT = `<script id="hana-view-client">
+(function(){
+  var VALID = {agents:1,providers:1,gateway:1,routing:1,usage:1,sessions:1,library:1,plugins:1,settings:1};
+  var q = new URLSearchParams(location.search || "");
+  if ((q.get("mode") || "window") !== "window") return;   // 托盘面板没有页签
+  var BASE = (function(){
+    var p = location.pathname || "/";
+    if (p === "/") return "";
+    return (p.charAt(p.length - 1) === "/") ? p.slice(0, -1) : p;
+  })();
+  var AT = BASE + "/_hana/view";
+  var last = "";
+  var sending = false, pending = null;
+
+  function report(v){
+    if (!v || v === last) return;
+    last = v;
+    if (sending) { pending = v; return; }        // 上一次还在路上：记下最新的一次，等它回来再发
+    sending = true;
+    try {
+      fetch(AT + "?view=" + encodeURIComponent(v), { method: "POST", keepalive: true })
+        .catch(function(){})
+        .then(function(){ sending = false; if (pending) { var n = pending; pending = null; report(n); } });
+    } catch (e) { sending = false; }
+  }
+
+  function current(){
+    var v = "";
+    try { v = new URLSearchParams(location.search || "").get("view") || ""; } catch (e) {}
+    if (VALID[v]) return v;
+    // Agent 是 magpie 的默认页，它自己不写进地址（syncURL 里 delete("view")）。
+    // 所以地址里没有 view 就是「在 Agent 页」——这里必须把它认成 agents 而
+    // 不是空值，否则用户从「用量」点回「Agent」时，记下的还会是旧的「用量」。
+    return "agents";
+  }
+
+  // 主路：包住 history.replaceState。app.js 每次 show() 都会调它把页写回地址栏，
+  // 在这里取新值零延迟，也不用轮询。
+  try {
+    var rs = history.replaceState;
+    if (typeof rs === "function") {
+      history.replaceState = function(){
+        var r = rs.apply(this, arguments);
+        try { report(current()); } catch (e) {}
+        return r;
+      };
+    }
+  } catch (e) {}
+
+  // 兜底：万一 magpie 换了写法去动地址栏（或经链接跳转），一秒比对一次全量 URL。
+  // 只有真变了才发，代价可以忽略。
+  var prevHref = String(location.href);
+  setInterval(function(){
+    var href = String(location.href);
+    if (href === prevHref) return;
+    prevHref = href;
+    report(current());
+  }, 1000);
+
+  // 首屏若地址上就带着页（壳子拼进来的那一份），把它认成「这一趟到的页」，
+  // 免得后面第一次换页时把 last 判成空而多发一条。
+  // 注意：首屏不发上报。壳子没把上次那一页拼上时（比如读不到 /status），
+  // 页面就是默认的 Agent；那会儿若照agent上报，会把用户真正的记忆冲掉。
+  last = current();
+
+  // ── 替上游补一处首屏（2026-10-10）────────────────────────────────────────
+  // magpie 的每个页模块都在自己文件结尾补了一句「要是地址直接打开的是我这一页，
+  // 就自己加载一次」，因为 app.js 的启动段跑得比它们早：
+  //   library.js:  // opened on ?view=library: app.js showed the page before this was here
+  //                if (!page.hidden) load();
+  //   plugins.js:  // opened on the Plugins tab (?view=plugins): app.js showed it before
+  //                if (view === "plugins") load();
+  //   sessions.js: （没有这一句）
+  // 所以被地址直接打开到「会话」时，app.js 那一刻 window.loadSessionsPage 还是
+  // undefined（sessions.js 排在 app.js 后面），show() 里的 ?.() 默默跳过，页面
+  // 只剩下导航高亮、内容区空着，得手动切走再切回。这里替它补上。
+  // 门槛定成「这一页确实一个元素都没有」：已经自己画出来的页（library、plugins
+  // 现在都画得出来）不会被多叫一次，也就不会多读一遍数据。
+  var LATE_LOADERS = { sessions: "loadSessionsPage", library: "loadLibrary", plugins: "loadPlugins" };
+  function healFirstPaint(){
+    var v = "";
+    try { v = new URLSearchParams(location.search || "").get("view") || ""; } catch (e) {}
+    var name = LATE_LOADERS[v];
+    if (!name) return;
+    var box = document.getElementById("view-" + v);
+    if (!box || box.querySelector("*")) return;   // 已经有东西了，不是这一种
+    var fn = window[name];
+    if (typeof fn !== "function") return;
+    try { fn(); } catch (e) {}
+  }
+  // DOMContentLoaded 在各脚本执行完以后才来，那会儿这些 loader 都已就位
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", healFirstPaint);
+  else healFirstPaint();
+})();
+</script>
+`;
+
 function inject(html, vars) {
   let out = html;
   // 主题选择的初始值 + 服务端备好的变量表，直接写进页面。
@@ -1696,7 +1829,7 @@ function inject(html, vars) {
     else out = seed + out;
   }
   // ② 主题与隐藏规则放到 head 末尾（app.css 之后）
-  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + focusBlock() + importBlock() + THEME_CLIENT + SELECT_CLIENT + IMPORT_CLIENT;
+  const tail = themeBlock() + adaptBlock() + hiddenBlock() + selectBlock() + focusBlock() + importBlock() + THEME_CLIENT + SELECT_CLIENT + IMPORT_CLIENT + VIEW_CLIENT;
   if (/<\/head>/i.test(out)) out = out.replace(/<\/head>/i, tail + "</head>");
   else out += tail;
   state.rewrites += 1;
@@ -1963,10 +2096,17 @@ function proxyRequest(clientReq, clientRes) {
   }
 
   const headers = {};
+  // 文档请求不能带条件头。同一个页面每次都要重新注入（主题变量表、隐藏规则、
+  // 上次停在的页都在里面），而上游的 ETag 会让浏览器拿 If-None-Match 来问，
+  // 上游回 304 —— 304 不带正文，浏览器就继续用它自己缓存的那一份旧注入。
+  // 实测：卡片里 F5 一下，页面跑的还是上一个版本的上报脚本。
+  // 所以只要这一趟要的是文档（accept 里有 text/html），就不把条件头转上去。
+  const wantDoc = String((clientReq.headers && clientReq.headers.accept) || "").includes("text/html");
   for (const [k, v] of Object.entries(clientReq.headers)) {
     const lk = k.toLowerCase();
     if (HOP_BY_HOP.has(lk) || lk === "host" || lk === "content-length") continue;
     if (lk === "referer" || lk === "origin") continue;  // 别把跨源上下文传给上游
+    if (wantDoc && (lk === "if-none-match" || lk === "if-modified-since")) continue;
     headers[k] = v;
   }
   headers["host"] = `${UPSTREAM_HOST}:${state.upstreamPort}`;
@@ -1992,7 +2132,7 @@ function proxyRequest(clientReq, clientRes) {
     });
 
     // 非 HTML 原样透传（连 content-type / content-length / content-encoding 一起），
-    // 只对要注入重算的 HTML 剥掉这三个。
+    // 只对要注入重算的 HTML 剥掉这几个。
     const outHeaders = {};
     for (const [k, v] of Object.entries(upRes.headers)) {
       const lk = k.toLowerCase();
@@ -2000,6 +2140,9 @@ function proxyRequest(clientReq, clientRes) {
       // 去掉会妨碍我们注入/内嵌的头
       if (lk === "x-frame-options" || lk === "content-security-policy") continue;
       if (isHtml && (lk === "content-encoding" || lk === "content-length" || lk === "content-type")) continue;
+      // 文档的验证器一并拿掉：留着它，浏览器就会拿旧 ETag 来问、拿到 304、
+      // 然后继续用那份旧注入（上面已经拦了入站条件头，这里是不让它再生一个）。
+      if (isHtml && (lk === "etag" || lk === "last-modified" || lk === "expires" || lk === "age")) continue;
       outHeaders[lk] = v;
     }
 
@@ -2045,6 +2188,14 @@ function proxyRequest(clientReq, clientRes) {
       // 页面 HTML 本来只有 45KB，压不压差别很小，不值得赌。
       delete outHeaders["content-encoding"];
       delete outHeaders["vary"];
+      // 注过的 HTML 不进浏览器缓存。
+      // 两个理由：① 这份 HTML 里嵌着服务端当前的状态（主题变量表、隐藏规则、
+      //    上次停在的页…），缓存住就会拿旧注入去撞新的状态（实测：卡片里 F5
+      //    一下，页面跑的还是上一个版本的上报脚本，新的压根没上来）；
+      //  ② 上游不给缓存头，浏览器会自己猜一个启发式新鲜度，猜错了不报错、
+      //    只静默拿旧的——最难查的那一类。
+      // 只影响文档；静态资源不受影响（带内容哈希的那批反而在下面给了长缓存）。
+      outHeaders["cache-control"] = "no-store";
       outHeaders["content-length"] = String(buf.length);
       try {
         clientRes.writeHead(upRes.statusCode || 200, outHeaders);
@@ -2335,6 +2486,7 @@ async function handleInternal(req, res) {
       themeChoice: state.themeChoice,
       themeApplied: state.themeApplied,
       themeVarsCached: !!(themeCache && themeCache.vars),
+      view: state.view || readView(),
       diagCount: state.diag.length,
       cache: { ...state.cacheStats, entries: state.cacheCount, paths: [...CACHED_GETS.keys()] },
       env: envSnapshot(),
@@ -2384,6 +2536,22 @@ async function handleInternal(req, res) {
     // choice：卡片里的「外观」下拉与设置页的主题下拉共用同一个选择，
     // 所以把这个值一并给页面，它才能把标签对到当前那一项。
     sendJson(res, { ok: true, choice: state.themeChoice || "auto", ...hostThemeInfo() });
+    return true;
+  }
+
+  // 上次停在哪一页：GET 给卡片壳读（它拼进 iframe 地址），POST 由页面换页时上报。
+  // 值走查询串也走 body —— 上报用的是 fetch(url?view=…, {method:"POST"})，
+  // 不写 body 更省事，也避开预检。
+  if (path === "/_hana/view") {
+    if (req.method === "POST") {
+      const want = new URL(req.url || "/", "http://x").searchParams.get("view");
+      const b = want === null ? await readJson(req) : {};
+      const v = validView(want || (b && b.view));
+      if (v) { state.view = v; saveView(v); }
+      sendJson(res, { ok: !!v, view: state.view });
+      return true;
+    }
+    sendJson(res, { ok: true, view: state.view || readView() });
     return true;
   }
 
@@ -2652,7 +2820,7 @@ function shutdown() {
 }
 
 function main() {
-  const opts = { exe: "", cwd: "", port: 0, marker: "", hidden: null, theme: null };
+  const opts = { exe: "", cwd: "", port: 0, marker: "", hidden: null, theme: null, view: "" };
   for (const a of process.argv.slice(2)) {
     const i = a.indexOf("=");
     if (i < 0) continue;
@@ -2663,11 +2831,17 @@ function main() {
     else if (k === "--marker") opts.marker = v;
     else if (k === "--hidden") opts.hidden = v;
     else if (k === "--theme") opts.theme = v;
+    else if (k === "--view") opts.view = v;
   }
   if (opts.hidden !== null) {
     state.hidden = new Set(opts.hidden.split(",").map((s) => s.trim()).filter(Boolean));
   }
   if (opts.theme) state.themeChoice = opts.theme;
+  // 上次停在的页：App 启动时把它随参数带进来（它读的是同一份 view.json）；
+  // 没带就自己读一遍。记在内存里，GET /_hana/view 与 /_hana/status 都拿它答。
+  state.view = validView(opts.view) || readView();
+  if (opts.view && validView(opts.view)) saveView(state.view);
+  log(`上次停在的页：${state.view || "（还没记过）"}`);
   state.serverTheme = readHanaTheme();
   log(`Hana 主题（服务端读）：${state.serverTheme || "（未读到）"}`);
 
@@ -2728,7 +2902,9 @@ function main() {
     state.lastError = `代理监听失败（端口 ${opts.port}）：${e && e.message}`;
     log(state.lastError);
     process.stdout.write(`MAGPIE_PROXY_ERROR ${state.lastError}\n`);
-    process.exit(1);
+    // 退出码 7 = 「端口被占」（本仓 comfyui-hana 的同类约定）。
+    // App 会据此换一个端口重来（见 index.js 的 ensureStarted）。
+    process.exit(e && e.code === "EADDRINUSE" ? 7 : 1);
   });
 
   server.listen(opts.port, "127.0.0.1", () => {
