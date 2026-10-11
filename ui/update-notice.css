@@ -144,6 +144,8 @@
 .tt-update-ver-hd b { font: 600 14px/1 var(--tt-font-mono); }
 .tt-update-ver-hd span { font-size: 11.5px; color: var(--tt-t3); }
 .tt-update-ver-hd em { margin-left: auto; font-style: normal; font-size: 11px; color: var(--tt-t4); }
+/* 「当前」角标比「最新」清楚一档：它标的是界线，扫的时候得先认出它。 */
+.tt-update-ver-hd em.cur { color: var(--tt-t2); }
 /* 分组标题的颜色按关键词给（新增/修复/优化），认不出就不上色。 */
 .tt-update-grp { margin: 0 0 9px; }
 .tt-update-grp:last-child { margin-bottom: 0; }

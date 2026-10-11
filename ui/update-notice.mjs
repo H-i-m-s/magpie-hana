@@ -211,8 +211,13 @@ export function installUpdateNotice({ hana, api, mock = false, log = () => {} } 
         body.append(h("p", { className: "tt-update-note err" },
           hasUpdate ? `取回失败（${snapshot.error}），下面是上次取回的那份。` : `取回失败：${snapshot.error}`));
       }
-      if (hasUpdate) {
-        snapshot.notes.forEach((note, index) => {
+      // 列的是「更新说明」。自动浮起来（提醒）时只列当前之后的那几版，别拿十来条历史砸她；
+      // 她点名打开（「检查更新」/「查看更新说明」）时连已装过的历史一起列——
+      // 订阅源里本来就躺着最近十来次，以前已是最新时一条都不显示。
+      const history = Array.isArray(snapshot.history) ? snapshot.history : [];
+      const list = (manualOpen && history.length ? history : snapshot.notes) || [];
+      if (list.length) {
+        list.forEach((note) => {
           const groups = (note.sections || []).map((section) => {
             const tone = toneOf(section.heading);
             const kids = [];
@@ -220,11 +225,14 @@ export function installUpdateNotice({ hana, api, mock = false, log = () => {} } 
             kids.push(h("ul", {}, ...section.items.map((text) => h("li", {}, text))));
             return h("div", { className: `tt-update-grp${tone ? ` ${tone}` : ""}${section.heading ? "" : " bare"}` }, ...kids);
           });
+          // 角标：哪一版是她现在装的、哪一版是最新；两个指同一版时只说「当前」，不叠两个。
+          const isCurrent = !!snapshot.current && note.version === snapshot.current;
+          const isLatest = !!snapshot.latest && note.version === snapshot.latest.version;
           body.append(h("section", { className: "tt-update-ver" },
             h("div", { className: "tt-update-ver-hd" },
               h("b", {}, `v${note.version}`),
               monthDay(note.date) ? h("span", {}, monthDay(note.date)) : null,
-              index === 0 ? h("em", {}, "最新") : null,
+              isCurrent ? h("em", { className: "cur" }, "当前") : (isLatest ? h("em", {}, "最新") : null),
             ),
             ...groups,
           ));
@@ -266,6 +274,10 @@ export function installUpdateNotice({ hana, api, mock = false, log = () => {} } 
           h("button", { type: "button", className: "tt-btn primary", onClick: bail }, "关闭"),
         );
       } else {
+        // 已是最新时引导词是「看全部」：这里列的是最近十来条，GitHub 上才是全量。
+        if (snapshot.releasesUrl) {
+          foot.append(h("button", { type: "button", className: "tt-btn ghost", onClick: () => openExternal(snapshot.releasesUrl) }, "在 GitHub 查看全部 ↗"));
+        }
         foot.append(h("button", { type: "button", className: "tt-btn primary", onClick: bail }, "关闭"));
       }
 
@@ -295,10 +307,12 @@ export function installUpdateNotice({ hana, api, mock = false, log = () => {} } 
     if (disposed || !snapshot) return;
     clearTimer();
     closeDialog();
+    // manualOpen 必须在建节点之前定下来：buildDialog 里就会画第一帧，而那一帧靠它决定
+    // 列「新的那几版」还是列全部历史。closeDialog 会把它清成 false，所以顺序不能颠倒。
+    manualOpen = manual;
     const built = buildDialog(snapshot);
     dialog = built.node;
     painter = built.paint;
-    manualOpen = manual;
     document.body.appendChild(dialog);
     try { dialog.showModal(); }
     catch { try { dialog.setAttribute("open", ""); } catch {} }
