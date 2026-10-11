@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 import process from "node:process";
 import { say, step, info, warn, die } from "./console.mjs";
 import { run, runRetry, git, gh, gitQuiet, classify, sleepSync } from "./exec.mjs";
-import { MARKET, marketStage, verifyStage } from "./market.mjs";
+import { MARKET, marketStage, readPublishedItem, verifyStage } from "./market.mjs";
 
 const RELEASE_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(RELEASE_DIR, "..");
@@ -349,10 +349,31 @@ function preflight(config, ctx, args) {
 
     dropScreenshotsNotInTag(ctx);
 
-    const allTags = gitQuiet(["tag", "--list"]).stdout.split("\n").map((t) => t.trim()).filter(Boolean);
-    const highest = allTags.map((t) => t.replace(/^v/, "")).filter((v) => /^\d/.test(v)).sort(compareVersions).pop();
-    if (highest && compareVersions(ctx.version, highest) < 0) {
-      throw die(`要发的 ${ctx.version} 比现有的最高版本 ${highest} 还低`, "市场不允许版本倒退，换一个更高的版本号");
+    // 版本方向：拿「要发的版本」比「市场已发布的版本」。
+    //
+    // 比的是版本号本身。要发的那个来自 manifest.json（它随后会被写进 entry.json，
+    // packStage 会再断一次 entry.version 等于它）；市场已发布的那个来自 index.v2.json，
+    // 也就是上一次的 entry.json 里的 version。两个数都是「版本号」，不是 git tag。
+    //
+    // 不再看 git tag：tag 只是 Release 的地址，谁都能随手打一个。之前拿本地 tag 的最高值
+    // 当「现有版本」，会把「改了 release/ 顺手打了个新 tag、却没打算发新版」这种合法的重发
+    // 拦下来 —— 而市场那边根本不会因此拒绝（它比的是 entry 的 version）。
+    //
+    // 读不到市场时不拦：真倒退了市场那边还会再判一次，在这里因为联网失败拦住一次合法的
+    // 发布更糟。
+    const published = readPublishedItem(ctx);
+    if (published.unavailable) {
+      warn(`没读到市场已发布的版本，跳过版本方向检查：${published.reason}`);
+      info("真倒退了市场那边还会再判一次；这里是读到不到，不当成倒退");
+    } else if (published.missing) {
+      info(`市场里还没有 ${ctx.kind}/${ctx.id} 这一条，按首次登记处理（不比版本）`);
+    } else if (published.version && compareVersions(ctx.version, published.version) < 0) {
+      throw die(
+        `要发的 ${ctx.version} 比市场已发布的 ${published.version} 还低`,
+        "市场不允许版本倒退，把 manifest.json 的版本号提到比它高再发",
+      );
+    } else {
+      info(`版本方向没问题：市场已发布 ${published.version}，本次要发 ${ctx.version}`);
     }
 
     const existingRelease = run("gh", ["release", "view", ctx.tag, "--repo", config.releaseRepo, "--json", "assets"]);

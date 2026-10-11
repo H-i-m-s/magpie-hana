@@ -100,6 +100,57 @@ function readUpstreamFile(path, ref) {
   return Buffer.from(result.stdout.replace(/\s/g, ""), "base64").toString("utf8");
 }
 
+/**
+ * 读市场正本已发布的索引（index.v2.json），找出自己这一条。
+ *
+ * 三种返回值：
+ *   { unavailable: true, reason }   读不到（没网 / 没权限 / 索引坏了）
+ *   { missing: true }               市场里还没有这一条 —— 首次登记
+ *   { version, archive, repository } 已发布的那一条
+ *
+ * 判「版本倒退」就该用它：市场同步器判的也正是这个值 —— 它的 previous.version 取自
+ * index.v2.json 里那一条的 version，而那个 version 来自上一次的 entry.json（再往前是
+ * 那一次的 manifest.json）。
+ *
+ * 跟 git tag 没有关系。tag 只是 Release 的地址，谁都能随手打一个；拿 tag 当版本序列，
+ * 会把「改了 release/ 顺手打个新 tag、却没打算发新版」这种合法的重发拦下来。
+ *
+ * 这里刻意不用 readUpstreamFile：那个函数读不到就 die，而 die 会立刻打印一行 [停]，
+ * 调用方想放行也收不回去了。读不到只是「查不了」，交给调用方决定拦还是放。
+ */
+export function readPublishedItem(ctx) {
+  const head = ghApi(`repos/${MARKET.upstream}/git/ref/heads/${MARKET.upstreamBranch}`, { jq: ".object.sha" });
+  if (head.status !== 0) return { unavailable: true, reason: `读不到 ${MARKET.upstream} 的 HEAD` };
+  const sha = head.stdout.trim();
+  if (!/^[0-9a-f]{40}$/.test(sha)) return { unavailable: true, reason: `HEAD 不是提交 sha：${sha.slice(0, 40)}` };
+
+  // 必须走 raw（而不是默认的 base64 content 字段）：index.v2.json 现在 2.6 MB，每条目都内嵌
+  // 一张 data URI 图标，早就超过了 contents API 的 1 MB 内联上限 —— 超了它会给 content: ""，
+  // 解出来就是空串，报「Unexpected end of JSON input」。
+  const file = ghApi(`repos/${MARKET.upstream}/contents/index.v2.json?ref=${encodeURIComponent(sha)}`, {
+    headers: ["Accept: application/vnd.github.raw"],
+    acceptNonZero: true,
+    label: `gh api GET ${MARKET.upstream}/index.v2.json`,
+  });
+  if (file.status !== 0) return { unavailable: true, reason: `读不到 ${MARKET.upstream}/index.v2.json（gh 退出码 ${file.status}）` };
+
+  let index;
+  try {
+    index = JSON.parse(file.stdout);
+  } catch (e) {
+    return { unavailable: true, reason: `index.v2.json 解析失败：${(e && e.message) || e}` };
+  }
+
+  const items = Array.isArray(index && index.items) ? index.items : [];
+  const item = items.find((it) => it && it.kind === ctx.kind && it.id === ctx.id);
+  if (!item) return { missing: true };
+  return {
+    version: String(item.version || ""),
+    archive: item.archive || null,
+    repository: String(item.repository || ""),
+  };
+}
+
 /** 把登记和批准改好；返回 { registry, approvals, changed, addedEnrollment, changedEnrollment }。 */
 function planMarketEdit(registryText, approvalsText, ctx, config) {
   const registry = JSON.parse(registryText);
