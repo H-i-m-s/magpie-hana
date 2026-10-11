@@ -33,6 +33,7 @@
     })();
   </script>
   <link rel="stylesheet" href="./assets/app-ui.css">
+  <link rel="stylesheet" href="./update-notice.css">
   <style>
     /* ── 变量层 ────────────────────────────────────────────────────────────
        宿主主题注入的是 --bg / --bg-card / --text / --accent 这一套；
@@ -96,6 +97,24 @@
     .s-btn:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
     .s-btn--primary { background: var(--s-accent); border-color: var(--s-accent); color: #fff; }
     .s-btn--primary:hover { filter: brightness(1.06); }
+
+    /* 关于卡片：数字框、版本号、「有新版本」标记 */
+    .s-num {
+      font: inherit; font-size: 12.5px; width: 5.6em; text-align: right;
+      padding: 5px 9px; border-radius: var(--s-r-sm);
+      border: 1px solid var(--s-line); background: var(--s-card); color: var(--s-text);
+    }
+    .s-num:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
+    .s-num[data-bad] { border-color: var(--s-danger); }
+    .ver-b { font-family: var(--font-mono, ui-monospace, Consolas, monospace); font-weight: 600; }
+    .ver-tag {
+      margin-left: 8px; font: inherit; font-size: 11.5px; padding: 2px 8px;
+      border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--s-accent); background: var(--s-tint); color: var(--s-accent);
+    }
+    .ver-tag:hover { filter: brightness(1.08); }
+    .ver-tag:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
+    #intervalHint[data-bad] { color: var(--s-danger); }
 
     /* 隐藏功能：用面板里的 hana-toggle 开关（app-ui.css 已带样式） */
     .feat {
@@ -219,6 +238,47 @@
     <div id="hiddenList"></div>
   </div>
 
+  <div class="card">
+    <div class="row">
+      <div class="who">
+        <div class="name">关于</div>
+        <div class="desc">版本与更新说明。说明内容来自 GitHub Release，不随 App 打包；关掉更新提示后仍可在这里手动看。检查间隔到点就会自动去查一次。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="who">
+        <div class="name">版本</div>
+        <div class="desc">当前 <b class="ver-b" id="verCurrent">—</b> · 最新 <b class="ver-b" id="verLatest">—</b><button class="ver-tag" id="verTag" type="button" hidden>有新版本</button></div>
+      </div>
+      <button class="s-btn" id="verCheck" type="button">检查更新</button>
+    </div>
+    <div class="row">
+      <div class="who">
+        <div class="name">更新提示</div>
+        <div class="desc">查到新版本就弹窗提醒。关掉之后仍可在这里手动看。</div>
+      </div>
+      <div class="feat__right">
+        <button class="hana-toggle" id="updateToggle" type="button" role="switch" aria-label="更新提示" aria-checked="true"></button>
+      </div>
+    </div>
+    <div class="row">
+      <div class="who">
+        <div class="name">检查间隔</div>
+        <div class="desc" id="intervalHint">单位分钟，默认 360（6 小时）。超过就自动去查一次。</div>
+      </div>
+      <div class="feat__right">
+        <input class="s-num" id="intervalInput" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" aria-label="检查间隔（分钟）">
+      </div>
+    </div>
+    <div class="row">
+      <div class="who">
+        <div class="name">更新说明</div>
+        <div class="desc">「查看更新说明」只读上次检查的结果，一次网络都不出。</div>
+      </div>
+      <button class="s-btn" id="verNotes" type="button">查看更新说明</button>
+    </div>
+  </div>
+
   <script type="module">
     // 用 SDK 发请求。为什么不能用裸 fetch：设置页跑在宿主的沙箱 iframe 里，
     // 路由端要一个凭据（宿主在 iframe URL 里以 appSurfaceSession 下发，
@@ -226,6 +286,8 @@
     // 结果所有写操作都是 403 forbidden —— 而且是静默的，界面看着正常。
     // 同项目的 git-save-load / doc-intake / llama-monitor 设置页都走这条。
     import { hana } from './assets/sdk.js';
+    import { createUpdateApi } from './update-api.mjs';
+    import { installUpdateNotice } from './update-notice.mjs';
 
     // 路由相对于本 App 的 routes 根。SDK 会拼成
     //   /api/apps/magpie-hana/routes/magpie-hana/<path>
@@ -531,11 +593,88 @@
       setTimeout(refresh, 600);
     });
 
+    // ══ 关于：版本与更新说明 ══
+    // 取数通道给的还是上面那个 api()（它会带上宿主下发的凭据头）。
+    // 窗口与判断在 ui/update-notice.mjs，判断与状态在插件进程的 lib/update-check.mjs。
+    const updateApi = createUpdateApi({ fetchJson: (p, init) => api(ROUTE + p, init) });
+    const update = installUpdateNotice({
+      hana,
+      api: updateApi,
+      log: (m) => { try { console.warn('[magpie-hana]', m); } catch (e) {} },
+    });
+
+    const verCurrent = document.getElementById('verCurrent');
+    const verLatest = document.getElementById('verLatest');
+    const verTag = document.getElementById('verTag');
+    const updateToggle = document.getElementById('updateToggle');
+    const intervalInput = document.getElementById('intervalInput');
+    const intervalHint = document.getElementById('intervalHint');
+    const INTERVAL_HINT = intervalHint.textContent;
+
+    function setIntervalHint(text, bad) {
+      intervalHint.textContent = text || INTERVAL_HINT;
+      if (bad) intervalHint.dataset.bad = ''; else delete intervalHint.dataset.bad;
+      if (bad) intervalInput.setAttribute('data-bad', ''); else intervalInput.removeAttribute('data-bad');
+    }
+
+    // 快照一到就刷这一格：版本号、新版标记、开关、间隔。不自己算版本高低，只听服务端的判断。
+    function syncAbout(d) {
+      verCurrent.textContent = d && d.current ? 'v' + d.current : '—';
+      verLatest.textContent = d ? (d.latest ? 'v' + d.latest.version : '—') : '…';
+      const has = !!(d && d.hasUpdate);
+      verTag.hidden = !has;
+      if (has) verTag.textContent = '有新版本 v' + d.latest.version;
+      const on = d ? d.enabled !== false : true;
+      if (on) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
+      updateToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+      // 输入框正在填的时候别去覆盖它，否则打字打到一半会被刷走。
+      if (document.activeElement !== intervalInput) {
+        const minutes = (d && d.intervalMinutes) || 360;
+        if (intervalInput.value !== String(minutes)) intervalInput.value = String(minutes);
+        setIntervalHint('', false);
+      }
+    }
+    update?.subscribe(syncAbout);
+
+    updateToggle.addEventListener('click', async () => {
+      const on = !updateToggle.hasAttribute('data-checked');
+      if (on) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
+      updateToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+      try {
+        syncAbout(await updateApi.dismissUpdate({ action: 'toggle', enabled: on }));
+        void update?.refresh();
+      } catch (e) {
+        setIntervalHint('保存失败：' + ((e && e.message) || e), true);
+      }
+    });
+
+    // 间隔：打字时不判对错（打到一半不是错），失焦才试一次写入。
+    // 上下界的权威在服务端 —— 它说不行就把它的原话显出来，不在这里猜边界。
+    intervalInput.addEventListener('input', () => {
+      if (/^\d+$/.test(intervalInput.value.trim())) setIntervalHint('', false);
+    });
+    intervalInput.addEventListener('change', async () => {
+      const raw = intervalInput.value.trim();
+      if (!/^\d+$/.test(raw) || Number(raw) < 1) { setIntervalHint('要填一个大于 0 的整数分钟数', true); return; }
+      try {
+        syncAbout(await updateApi.setUpdateInterval(Number(raw)));
+        setIntervalHint('', false);
+        void update?.refresh();
+      } catch (e) {
+        setIntervalHint((e && e.message) || '保存失败', true);
+      }
+    });
+
+    document.getElementById('verCheck').addEventListener('click', () => { void update?.openManual(); });
+    document.getElementById('verNotes').addEventListener('click', () => { void update?.openCached(); });
+    verTag.addEventListener('click', () => { void update?.openManual(); });
+
     (async function boot() {
       // 先等 SDK 就绪再用 api（宿主会先建立 session）。
       // 兄弟 App（git-save-load / llama-monitor）都这么做。
       try { await hana.ready(); } catch (e) { /* 离线预览时没有宿主，忽略 */ }
       refresh();
+      void update?.refresh();
     })();
     setInterval(refresh, 4000);
   </script>

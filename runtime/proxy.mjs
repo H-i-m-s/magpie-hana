@@ -24,6 +24,7 @@ import { join, dirname } from "node:path";
 import { userInfo } from "node:os";
 import { connect } from "node:net";
 import { randomBytes } from "node:crypto";
+import { brotliDecompressSync, gunzipSync, inflateSync, inflateRawSync } from "node:zlib";
 // 托管进程的环境快照。
 //
 // 为什么要这个：magpie 靠「用户目录 + 各家 agent 的配置文件」判断本机装了哪些 agent。
@@ -56,6 +57,19 @@ const HOP_BY_HOP = new Set([
   "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
   "te", "trailer", "transfer-encoding", "upgrade",
 ]);
+
+// 上游自报的 content-encoding -> 正文。只解不压：反代出去的正文一律不压缩
+// （v0.3.0 给文本资源上过 br/gzip，卡片里所有 CSS/JS 全加载失败，见上）。
+function decodeBody(buf, encoding) {
+  const enc = String(encoding || "").toLowerCase().trim();
+  if (enc === "gzip" || enc === "x-gzip") return gunzipSync(buf);
+  if (enc === "br") return brotliDecompressSync(buf);
+  if (enc === "deflate") {
+    // 老实现有把 zlib 头去掉的（raw deflate），两种都试一次。
+    try { return inflateSync(buf); } catch { return inflateRawSync(buf); }
+  }
+  throw new Error("不认识的 content-encoding：" + enc);
+}
 
 const DEFAULT_HIDDEN = ["library", "sessions"];
 
@@ -2107,9 +2121,18 @@ function proxyRequest(clientReq, clientRes) {
     if (HOP_BY_HOP.has(lk) || lk === "host" || lk === "content-length") continue;
     if (lk === "referer" || lk === "origin") continue;  // 别把跨源上下文传给上游
     if (wantDoc && (lk === "if-none-match" || lk === "if-modified-since")) continue;
+    // accept-encoding 由本进程说了算，不听浏览器的（理由见下面那行 identity）。
+    if (lk === "accept-encoding") continue;
     headers[k] = v;
   }
   headers["host"] = `${UPSTREAM_HOST}:${state.upstreamPort}`;
+  // 固定向上游要未压缩的正文。
+  // 教训（2026-10-11）：原来把浏览器的 accept-encoding 原样转给上游，magpie 0.1.1184
+  // 起会照着它把首页压成 gzip 发回来。而 node:http 不会自动解压，HTML 分支又假定
+  // 「上游一定没压」——收完直接 toString、再把 content-encoding 抹掉——于是压缩流被
+  // 当成文本注入，还按 text/html 发给卡片：浏览器把 gzip 字节当字排，满屏乱码。
+  // 这里改成反代对浏览器单方面承诺不压缩，上游也就没必要压。
+  headers["accept-encoding"] = "identity";
   // webGuard 对所有请求都要 key（不豁免回环），用 cookie 带上
   if (state.upstreamKey) headers.cookie = `magpie_web_${state.upstreamPort}=${state.upstreamKey}`;
 
@@ -2173,7 +2196,22 @@ function proxyRequest(clientReq, clientRes) {
       if (size > 32 * 1024 * 1024) { try { upRes.destroy(); } catch { /* 忽略 */ } }
     });
     upRes.on("end", async () => {
-      let text = Buffer.concat(chunks).toString("utf8");
+      // 上游可能无视我们要的 identity 照压不误（只看 Accept-Encoding 里有没有 gzip
+      // 的中间件就不会认 identity 的语义），所以这里再按它自报的编码解一次。
+      // 压缩流一旦被当文本处理，字节就毁了——toString("utf8") 会把残缺字节换成
+      // U+FFFD，再编码回去已经无从还原，所以解压只能发生在 toString 之前。
+      let raw = Buffer.concat(chunks);
+      const upCe = String(upRes.headers["content-encoding"] || "").toLowerCase().trim();
+      if (upCe && upCe !== "identity") {
+        try {
+          raw = decodeBody(raw, upCe);
+        } catch (e) {
+          state.lastError = "解压上游响应失败（" + upCe + "）：" + String(e);
+          try { sendUnavailable(clientReq, clientRes, state.lastError); } catch { /* 忽略 */ }
+          return;
+        }
+      }
+      let text = raw.toString("utf8");
       try {
         // 页面要注入主题变量。变量表从宿主取（取不到就用上一次的缓存）。
         const vars = await themeVars();

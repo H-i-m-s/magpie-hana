@@ -22,6 +22,8 @@ import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// 更新说明：内容来自 GitHub Release，不硬编码进界面（见 lib/update-check.mjs 顶部的来源说明）。
+import { createUpdateCheck } from "./lib/update-check.mjs";
 
 const APP_ID = "magpie-hana";
 const APP_VERSION = "0.5.2";
@@ -36,6 +38,13 @@ const READY_POLL_MS = 400;
 const RETRY_DELAYS_MS = [3_000, 10_000, 30_000, 60_000];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 取查询串参数。宿主不同版本给的形状不一样：新的有 c.req.query(name)，老一点的只有
+// c.req.url。两条都试，都取不到就返回 null（当没传）。
+function queryOf(c, name) {
+  try { if (typeof c?.req?.query === "function") return c.req.query(name); } catch { /* 往下试 */ }
+  try { return new URL(String(c?.req?.url || ""), "http://localhost").searchParams.get(name); } catch { return null; }
+}
 
 export const name = APP_ID;
 
@@ -61,6 +70,28 @@ export default defineApp(async (sdk) => {
   const viewFile = join(dataDir, "view.json");
 
   log(`apply | dataDir=${dataDir} | appRoot=${appRoot} | v${APP_VERSION}`);
+
+  // ── 更新说明（去 GitHub 看有没有新版）──────────────────────────────────────
+  // 当前版本只认包根的 manifest.json：release/ 那套工具链把它定为唯一事实源
+  // （入包的 zip 里带的就是它，tag 与发布门禁也认它）。上面那个 APP_VERSION 是本
+  // App 自己的代码版本，跟发出去的版本不是一回事，历史上漂过，不参与判断。
+  const readAppVersion = () => {
+    try {
+      const text = readFileSync(join(appRoot, "manifest.json"), "utf8").replace(/^\uFEFF/, "");
+      return String(JSON.parse(text)?.version || "");
+    } catch (e) {
+      warn(`manifest.json 读不到，版本号留空：${msgOf(e)}`);
+      return "";
+    }
+  };
+  const appVersion = readAppVersion();
+  // 出站只能走宿主的受控通道：v2 App 的子进程没开 --net，裸 fetch 会被运行时直接拒掉，
+  // 报出来还只是一句「fetch failed」。能去哪些域名写在 manifest.json 的 network.allowedHosts。
+  const netFetch = typeof sdk?.network?.fetch === "function" ? (url, init) => sdk.network.fetch(url, init) : null;
+  if (!netFetch) warn("宿主没有给出站网络通道 sdk.network.fetch，更新检查会直说没有网络能力");
+  // 那边的 log 形状是 log(level, message)，与本文件的 log/warn/err 不同，转一道。
+  const ucLog = (level, ...args) => (level === "warn" ? warn : log)(`更新说明：${args.join(" ")}`);
+  const updateCheck = createUpdateCheck({ dataDir, appVersion, log: ucLog, fetchImpl: netFetch });
 
   // ── 状态 ──────────────────────────────────────────────────────────────────
   const state = {
@@ -683,12 +714,59 @@ export default defineApp(async (sdk) => {
         ok: true, theme: state.themeChoice, appearance: state.themeAttr,
       }));
 
+      // ── 更新说明 ──────────────────────────────────────────────────
+      // GET：给界面一份快照。force=1 强制去 GitHub 取一次；cached=1 只交手里那份，
+      // 一次网络都不出（「查看更新说明」走这条，所以它永远是上次检查的结果）。
+      app.get("/magpie-hana/update-check", async (c) => {
+        try {
+          if (queryOf(c, "cached") === "1") return c.json({ ok: true, update: updateCheck.snapshot() });
+          const update = await updateCheck.check({ force: queryOf(c, "force") === "1" });
+          return c.json({ ok: true, update });
+        } catch (e) {
+          err(`GET /magpie-hana/update-check 失败：${msgOf(e)}`);
+          return c.json({ ok: false, error: msgOf(e) }, 503);
+        }
+      });
+
+      // POST：「我已知晓」与「先不看」都走这里。后者只记在插件进程内存里，App 一重启就忘。
+      // 另外两个动作是设置页那两格：更新提示开关、自动检查的间隔（分钟）。
+      app.post("/magpie-hana/update-check", async (c) => {
+        let body = {};
+        try {
+          body = await c.req.json();
+        } catch { return c.json({ ok: false, error: "请求体必须是 JSON" }, 400); }
+        const action = String(body?.action || "");
+        let update;
+        try {
+          if (action === "ack" || action === "later") {
+            update = updateCheck.dismiss(body.version, action === "ack" ? "read" : "later");
+          } else if (action === "toggle") {
+            update = updateCheck.setEnabled(body.enabled !== false);
+          } else if (action === "interval") {
+            update = updateCheck.setIntervalMinutes(body.minutes);
+          } else {
+            return c.json({ ok: false, error: "action 只认 ack / later / toggle / interval" }, 400);
+          }
+        } catch (e) {
+          // 间隔非法是这里唯一的预料内错误：setIntervalMinutes 带着自己的文案抛。
+          return c.json({ ok: false, error: msgOf(e) }, 400);
+        }
+        return c.json({ ok: true, update });
+      });
+
       app.get("/magpie-hana/health", (c) => c.json({ ok: true, app: { id: APP_ID, version: APP_VERSION } }));
     });
     log("路由已注册");
   } catch (e) {
     err(`注册路由失败：${msgOf(e)}`);
   }
+
+  // 开场先看一眼有没有新版：异步、失败不吵。它有检查间隔节流（默认 6 小时），不会
+  // 每次启动都去 GitHub；这样打开设置页或卡片时，版本号与「有新版本」标记已经在了。
+  fire((async () => {
+    await sleep(3000);
+    try { await updateCheck.check(); } catch (e) { warn(`开场检查更新失败：${msgOf(e)}`); }
+  })());
 
   // ── 生图供应商（app/media.provide）────────────────────────────────────────
   // 把 magpie 网关接成 Hana 的媒体提供方：装完就在「多媒体」里出现一个叫 magpie 的

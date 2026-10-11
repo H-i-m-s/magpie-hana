@@ -31,6 +31,7 @@
   所以这里改成：有变量就用变量，没有就**保持透明**，让卡片自己的底色透出来 ——
   宁可什么都不画，也不要自己选一个跟主题不对付的颜色。
 -->
+<link rel="stylesheet" href="./update-notice.css">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden;
     background: var(--bg, var(--hana-bg, transparent));
@@ -200,6 +201,49 @@
         try { frame.contentWindow.postMessage({ type: "magpie-hana:choice-result", ok: false, error: String((err && err.message) || err) }, "*"); } catch (_) {}
       });
   });
+
+  // ── 更新说明（从 token-tracker 移植过来）────────────────────────────────
+  // 弹窗与判断在 ui/update-notice.mjs（ES 模块），而本壳子一直是老式脚本，
+  // 所以用动态 import 就地取进来 —— 凭据阶梯与 ABS 都能直接用，不必在模块里再抄一遍。
+  // 没有 SDK 就只能自己带凭据：跟上面 readStatus() 走的是同一套阶梯。
+  function readJson(path, init) {
+    var opts = init || {};
+    var extra = opts.headers || {};
+    function build(ticket) {
+      var headers = {};
+      if (ticket) headers["X-Hana-App-Surface-Session"] = ticket;
+      Object.keys(extra).forEach(function (k) { headers[k] = extra[k]; });
+      var o = { credentials: "same-origin", method: opts.method || "GET", headers: headers };
+      if (opts.body != null) o.body = opts.body;
+      return o;
+    }
+    function attempt(ticket) {
+      return fetch(ABS + path, build(ticket)).then(function (r) {
+        return r.json().catch(function () { return { ok: false, error: "HTTP " + r.status }; });
+      });
+    }
+    var s = sessionFromUrl();
+    return s ? attempt(s.value).catch(function () { return attempt(null); }) : attempt(null);
+  }
+
+  import("./update-notice.mjs")
+    .then(function (mod) {
+      return import("./update-api.mjs").then(function (apiMod) { return { mod: mod, apiMod: apiMod }; });
+    })
+    .then(function (loaded) {
+      var api = loaded.apiMod.createUpdateApi({ fetchJson: readJson });
+      // hana 传 null：本文档里没有 SDK（实测 window.hana 不存在），
+      // 弹窗里那个「在 GitHub 查看」会退回 window.open。
+      window.__magpieUpdateNotice = loaded.mod.installUpdateNotice({
+        hana: null,
+        api: api,
+        log: function (m) { try { console.warn("[magpie-hana]", m); } catch (_) {} }
+      });
+    })
+    .catch(function (e) {
+      // 取不到就算了：它只是个提醒，不该让卡片本身出错。
+      try { console.warn("[magpie-hana] 更新说明没装上：" + ((e && e.message) || e)); } catch (_) {}
+    });
 
   connect();
 })();
