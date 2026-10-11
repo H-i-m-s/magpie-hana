@@ -36,7 +36,10 @@
   --tt-select-fg: var(--s-accent, var(--selected-fg, var(--accent, #7aa2ff)));
   --tt-select-b: var(--s-accent, var(--selected-border, var(--accent, #7aa2ff)));
   --tt-red: var(--s-danger, var(--danger, #e06c75));
-  --tt-orange: var(--warning, var(--coral, #d9a25f));
+  /* 宿主只给 --green 与 --danger 两个语义色，没有 warning 这一档。
+     这个变量在本弹窗里只用在「取回失败」那行字上，那本来就是错，所以并到 danger
+     这条链上 —— 不自己编一个橙色，编出来的颜色最容易跟主题打架。 */
+  --tt-orange: var(--s-danger, var(--danger, #e06c75));
   --tt-green: var(--success, var(--green, #6fbf9b));
   --tt-blue: var(--s-accent, var(--chart-blue, var(--accent, #7aa2ff)));
 

@@ -30,7 +30,44 @@
   闪一下黑。平台的做法是注入主题变量（其它卡片 CSS 就直接写 var(--text, …)），
   所以这里改成：有变量就用变量，没有就**保持透明**，让卡片自己的底色透出来 ——
   宁可什么都不画，也不要自己选一个跟主题不对付的颜色。
+
+  【变量不会自己出现（2026-10-11）】上面那句「平台的做法是注入主题变量」说得太顺。
+  实际是：宿主只把「当前主题完整 CSS」的地址经 iframe URL 下发（hana-css，外加
+  hana-theme-appearance 与 hana-palette-<appearance>-css），**要文档自己插个 <link>
+  把它装上**。设置页一直是这么做的；本壳子从来没做过，于是文档里 --bg / --text /
+  --bg-card 一个都不存在，凡是 var(--x, 兜底) 的地方全吃兜底值 —— 更新说明弹窗就是
+  这么变成一块跟主题无关的深色的（实测：宿主主题 midnight 的 --bg-card 是 #445560，
+  弹窗画的却是兜底的 #14171d）。
+  别的 App 卡片不用管这件事，是因为它们的卡片引了 Hana SDK、SDK 替它们装了；本文档是
+  route 型、宿主不注入 SDK，所以只能自己来 —— 就是下面这一段。
 -->
+<script>
+  /* 把宿主下发的主题 CSS 装成一个 <link>。
+     放在 <style> 之前：先有变量，再画第一帧。不装的话后果见上面那段。 */
+  (function () {
+    try {
+      var p = new URLSearchParams(location.search || "");
+      var href = p.get("hana-css");
+      var appearance = p.get("hana-theme-appearance");
+      if (appearance) {
+        var themed = p.get("hana-palette-" + appearance + "-css");
+        if (themed) href = themed;
+      }
+      if (!href) {
+        // 没给就当场记一笔，别默默吃兜底色（下面的 var(--x, 兜底) 是退路，不是常态）。
+        document.documentElement.setAttribute("data-hana-theme-missing", "1");
+        return;
+      }
+      var link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = href;
+      link.setAttribute("data-hana-theme", "1");
+      document.head.appendChild(link);
+    } catch (e) {
+      /* 主题拿不到不影响卡片能不能用 */
+    }
+  })();
+</script>
 <link rel="stylesheet" href="./update-notice.css">
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden;

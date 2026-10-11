@@ -47,6 +47,8 @@
       --s-tint: var(--accent-light, rgba(83, 125, 150, 0.10));
       --s-line: var(--border, rgba(0, 0, 0, 0.12));
       --s-danger: var(--danger, #C0616B);
+      /* 成功色。宿主只给 --green（没有 --success 那一档），取值与 token-tracker 那边同一个。 */
+      --s-green: var(--green, #3d9a63);
       --s-hover: var(--overlay-subtle, rgba(0, 0, 0, 0.04));
       --s-r: calc(12px * var(--corner-radius-scale, 1));
       --s-r-sm: calc(8px * var(--corner-radius-scale, 1));
@@ -115,6 +117,41 @@
     .ver-tag:hover { filter: brightness(1.08); }
     .ver-tag:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
     #intervalHint[data-bad] { color: var(--s-danger); }
+
+    /* ── 卡片头右侧的状态区（照 token-tracker 的 .tts-card__right）─────────────
+       顺序：恢复入口 → 保存反馈。两张都在同一个位置出现/消失，所以位置固定、
+       不互相推挤；「恢复上次的值」平时占着位置但 opacity:0 且不接手点击。
+       出现与消失都走渐变（这一条是这边多加的，token-tracker 那边是硬切）；
+       退场要先淡完再清文字，否则会先塌成一格再淡，看着像闪。 */
+    .card-right { display: flex; align-items: center; justify-content: flex-end; gap: 10px; min-width: 0; }
+    .hs-row { display: flex; justify-content: flex-end; margin-top: 8px; }
+
+    /* 「恢复上次的值」：无边框的小字 + 虚线下划线（同 token-tracker 的 .tts-card__restore）。
+       只在「眼前的这一份 ≠ 上一次保存成功的那一份」时点亮。 */
+    .card-restore {
+      border: 0; padding: 0; background: none; cursor: pointer;
+      color: var(--s-muted); font: 11.5px var(--font-ui, system-ui, sans-serif);
+      text-decoration: underline dotted color-mix(in srgb, var(--s-muted) 60%, transparent);
+      text-underline-offset: 3px;
+      opacity: 0; pointer-events: none;
+      transition: opacity 160ms var(--ease-out, ease), color var(--duration-fast, .15s) var(--ease-out, ease);
+    }
+    .card-restore.is-on { opacity: 1; pointer-events: auto; }
+    .card-restore:hover { color: var(--s-text); }
+    .card-restore:focus-visible { outline: 2px solid var(--s-accent); outline-offset: 2px; }
+
+    /* 保存反馈（就是 token-tracker 的 .tts-card__state 那个位置与配色）：
+       绿「已保存」两秒后淡走，红「保存失败」留着等人看；填得不对也走红的那条。
+       那边另有一个「保存中…」态 —— 这里不加：本页的写入都是本地回环、毫秒级，
+       多闪一个中间态只会让人觉得在抖。 */
+    .save-note {
+      font-size: 11.5px; color: var(--s-sub); white-space: nowrap;
+      opacity: 0; transition: opacity 160ms var(--ease-out, ease);
+    }
+    .save-note.is-on { opacity: 1; }
+    .save-note[data-kind="ok"] { color: var(--s-green); }
+    .save-note[data-kind="err"] { color: var(--s-danger); white-space: normal; text-align: right; max-width: 46%; }
+    @media (prefers-reduced-motion: reduce) { .save-note, .card-restore { transition: none; } }
 
     /* 隐藏功能：用面板里的 hana-toggle 开关（app-ui.css 已带样式） */
     .feat {
@@ -216,6 +253,13 @@
         <div class="name">主题</div>
         <div class="desc">自动 = 跟随 Hana 当前主题，你在 Hana 里换，卡片里 5 秒内跟上。也可以钉住某一套 Hana 主题。<br>卡片里那个「外观」下拉与本清单逐项一致（同一个存储），改哪边另一边都会跟上。</div>
       </div>
+      <div class="card-right">
+        <button class="card-restore" id="themeRestore" type="button" title="恢复成上一次保存成功的值">恢复上次的值</button>
+        <span class="save-note" id="themeSave"></span>
+      </div>
+    </div>
+    <!-- 控件自占一行、靠右。这样三张卡的骨架就一致了：头部行管名字与状态，控件行管控件。 -->
+    <div class="hs-row">
       <div class="hs" id="themeHs">
         <button class="hs-trigger" id="themeTrigger" type="button" aria-haspopup="listbox" aria-expanded="false">
           <span class="hs-label" id="themeLabel">自动（跟随 Hana）</span>
@@ -225,7 +269,6 @@
       <!-- 原生 select 藏起来当状态源；自绘下拉只负责视觉与交互 -->
       <select id="themeSel" hidden></select>
     </div>
-    <div id="themeNote" class="kv"></div>
   </div>
 
   <div class="card">
@@ -233,6 +276,10 @@
       <div class="who">
         <div class="name">工作区里的功能</div>
         <div class="desc">开关表示这个功能是否出现在工作区里：开着 = 显示中，关掉 = 隐藏入口（只隐藏入口，不解除底层能力）。改动立即生效，重新打开工作区即可看到。</div>
+      </div>
+      <div class="card-right">
+        <button class="card-restore" id="featuresRestore" type="button" title="恢复成上一次保存成功的值">恢复上次的值</button>
+        <span class="save-note" id="featuresSave"></span>
       </div>
     </div>
     <div id="hiddenList"></div>
@@ -243,6 +290,10 @@
       <div class="who">
         <div class="name">关于</div>
         <div class="desc">版本与更新说明。说明内容来自 GitHub Release，不随 App 打包；关掉更新提示后仍可在这里手动看。检查间隔到点就会自动去查一次。</div>
+      </div>
+      <div class="card-right">
+        <button class="card-restore" id="aboutRestore" type="button" title="恢复成上一次保存成功的值">恢复上次的值</button>
+        <span class="save-note" id="aboutSave"></span>
       </div>
     </div>
     <div class="row">
@@ -324,6 +375,113 @@
         return { ok: false, error: 'SDK 不可用：' + sdkErr };
       }
     }
+    // ══ 提交口：每张卡的保存、失败、恢复（照 token-tracker 的 registerCard / commitCard / restoreCard）══
+    // 一张卡三件事必须成套给，缺一样这张卡就不自洽：
+    //   read()         从 DOM 收这张卡的值（DOM 是唯一状态源，读完不留影子状态）
+    //   write(values)  怎么落盘；抛错就摆成「保存失败」
+    //   apply(values)  把值写回 DOM（「恢复上次的值」用）
+    // 基线（baseline）记的是**这张卡上一次保存成功的那一份**，每写成功一次就往前推一格。
+    // 所以「恢复上次的值」只在两种时候亮：写失败了、眼里还留着没生效的新值；
+    // 或者框里填了个还没提交（或填得不对）的东西。它不会替她撤销已经存好的改动。
+    const SAVED_FADE_MS = 2000;   // 与 token-tracker 的 SAVED_FADE_MS 同值
+    const FADE_MS = 200;          // 与 CSS 里那条 160ms 过渡对齐，留点余量
+    const cards = new Map();
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn) => setTimeout(fn, 0);
+
+    function registerCard(id, spec) {
+      const card = {
+        id,
+        ...spec,
+        restoreEl: document.getElementById(id + 'Restore'),
+        stateEl: document.getElementById(id + 'Save'),
+        baseline: '', busy: false, pending: false, fade: null, fadeOut: null,
+      };
+      cards.set(id, card);
+      // 恢复入口只挂一次；点亮/熄灭全由 syncRestore 管。
+      card.restoreEl?.addEventListener('click', () => { void restoreCard(id); });
+      return card;
+    }
+
+    function cardValue(card) {
+      try { return JSON.stringify(card.read()); } catch { return card.baseline; }
+    }
+
+    /**
+     * 新的「上次的值」。
+     * values 只在「刚写成功」时传：那才是真正落盘的那一份。不传就取眼前这一份
+     * （服务端刚把值发回来、DOM 刚采纳它的那种时候）。
+     * 写成功时一定要传 values —— 否则写的路上她又改了一次的话，那一笔会被记成
+     * 「已经存好了」，pending 补发时被「没变就不发」吃掉，改动就丢了。
+     * （token-tracker 那边是直接取眼前这一份，所以它也有这个洞。）
+     */
+    function markClean(card, values) {
+      card.baseline = values === undefined ? cardValue(card) : JSON.stringify(values);
+      syncRestore(card);
+    }
+
+    function syncRestore(card) {
+      if (!card?.restoreEl) return;
+      card.restoreEl.classList.toggle('is-on', cardValue(card) !== card.baseline);
+    }
+
+    /** 卡片头的反馈：出现淡入、消失淡出；只有「已保存」才自己走，错误留着。 */
+    function setCardState(card, text, kind, fade = false) {
+      const el = card.stateEl;
+      if (!el) return;
+      if (card.fade) { clearTimeout(card.fade); card.fade = null; }
+      if (card.fadeOut) { clearTimeout(card.fadeOut); card.fadeOut = null; }
+      if (text) {
+        el.textContent = text;
+        el.dataset.kind = kind === 'err' ? 'err' : 'ok';
+        raf(() => el.classList.add('is-on'));
+      } else {
+        el.classList.remove('is-on');
+      }
+      if (text && fade) {
+        card.fade = setTimeout(() => {
+          card.fade = null;
+          el.classList.remove('is-on');                     // 先淡出
+          card.fadeOut = setTimeout(() => {                 // 等淡完再清文字，不然会先塌成一格
+            card.fadeOut = null;
+            el.textContent = '';
+            delete el.dataset.kind;
+          }, FADE_MS);
+        }, SAVED_FADE_MS);
+      }
+    }
+
+    async function commitCard(id, { force = false } = {}) {
+      const card = cards.get(id);
+      if (!card) return;
+      if (card.busy) { card.pending = true; return; }          // 上一笔还没回来：记住，不丢
+      if (!force && cardValue(card) === card.baseline) { syncRestore(card); return; }
+      if (card.validate && !card.validate()) { setCardState(card, '填得不对', 'err'); syncRestore(card); return; }
+      card.busy = true;
+      const values = card.read();          // 这一笔到底发的是什么，发出去之前先抓住
+      try {
+        await card.write(values);
+        markClean(card, values);           // 基线记刚写成功的那一份，不是眼前这一份
+        setCardState(card, '已保存', 'ok', true);
+      } catch (e) {
+        // 失败不撤回眼里的那一份：留着 + 点亮「恢复上次的值」，收不收由她定。
+        setCardState(card, '保存失败：' + ((e && e.message) || e), 'err');
+        syncRestore(card);
+      } finally {
+        card.busy = false;
+        if (card.pending) { card.pending = false; void commitCard(id); }
+      }
+    }
+
+    /** 回到基线值，再照常走一遍提交（force：还原后 DOM 等于基线，普通提交会被「没变就不发」挡掉）。 */
+    async function restoreCard(id) {
+      const card = cards.get(id);
+      if (!card || !card.baseline) return;
+      try { card.apply(JSON.parse(card.baseline)); } catch { /* 基线解不出来就不动 DOM */ }
+      syncRestore(card);
+      await commitCard(id, { force: true });
+    }
+    // ══ 提交口结束 ══
+
     const FEATURES = [
       { id: 'library', label: 'Library（往各 agent 写指令/MCP/skill）' },
       { id: 'sessions', label: 'Sessions（magpie 自己的会话日志）' },
@@ -487,24 +645,33 @@
       themeSel.appendChild(o);
     }
 
+    // 选定就提交，走同一套口子（保存反馈与恢复入口都归它管）。
+    // 那条旧提示「已打开的工作区最多 15 秒内跟上」并掉了：卡片说明里已经写着「你在 Hana 里换，
+    // 卡片里 5 秒内跟上」，两句在同一页上打架，留说明那一句。
     const themeDrop = createDropdown(
       'themeHs',
       THEMES.map((t, i) => ({ ...t, sepBefore: i === 1 })), // 自动 / 具体主题 之间加一条细分隔
       'auto',
-      async (v) => {
-        const note = document.getElementById('themeNote');
+      (v) => {
+        // 原生 select 是状态源：一选就同步过去再提交，否则 read() 读到的还是旧值。
+        themeSel.value = v;
+        void commitCard('theme');
+      },
+    );
+
+    let themeReady = false;
+    const themeCard = registerCard('theme', {
+      read: () => ({ theme: themeSel.value }),
+      write: async (v) => {
         const r = await api(`${ROUTE}/theme`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ theme: v }),
+          body: JSON.stringify({ theme: v.theme }),
         });
-        const text = (THEMES.find((t) => t.id === v) || {}).label || v;
-        note.textContent = r && r.ok
-          ? '已设为：' + text + '（已打开的工作区最多 15 秒内跟上）'
-          : '保存失败：' + ((r && r.error) || '未知错误');
-        setTimeout(() => { note.textContent = ''; }, 4000);
+        if (r && r.ok === false) throw new Error(r.error || '服务端没接受这次改动');
       },
-    );
+      apply: (v) => { themeSel.value = v.theme; themeDrop.sync(v.theme); },
+    });
 
     // ══ 隐藏功能 ══
     let hidden = [];
@@ -515,6 +682,7 @@
       for (const f of FEATURES) {
         const row = document.createElement('div');
         row.className = 'feat';
+        row.dataset.featureId = f.id;   // 「恢复上次的值」靠它从 DOM 里把值收回来
 
         const nm = document.createElement('div');
         nm.className = 'feat__name';
@@ -538,14 +706,14 @@
         // 之前反着喂，才会出现「已隐藏」看着像开着。
         if (!isHidden) sw.setAttribute('data-checked', '');
         sw.setAttribute('aria-checked', isHidden ? 'false' : 'true');
-        sw.addEventListener('click', async () => {
-          hidden = isHidden ? hidden.filter((x) => x !== f.id) : [...hidden, f.id];
-          await api(`${ROUTE}/hidden`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ hidden }),
-          });
-          renderHidden();
+        sw.addEventListener('click', () => {
+          // 只翻 DOM 上这一份，提交交给同一套口子。
+          // 写失败时不再偷偷拨回去：眼里的改动留着，卡片头亮出「恢复上次的值」给她收。
+          const wasOn = sw.hasAttribute('data-checked');
+          if (wasOn) sw.removeAttribute('data-checked'); else sw.setAttribute('data-checked', '');
+          sw.setAttribute('aria-checked', wasOn ? 'false' : 'true');
+          state.textContent = wasOn ? '已隐藏' : '显示中';
+          void commitCard('features');
         });
 
         right.appendChild(state);
@@ -556,10 +724,43 @@
       }
     }
 
+    // 功能卡的值以 DOM 为准：开关上的 data-checked 就是「眼下这一份」，
+    // 拿它跟上次存好的那份比，才谈得上「恢复上次的值」。
+    function readHiddenFromDom() {
+      const out = [];
+      for (const row of document.querySelectorAll('#hiddenList .feat')) {
+        const sw = row.querySelector('.hana-toggle');
+        if (row.dataset.featureId && sw && !sw.hasAttribute('data-checked')) out.push(row.dataset.featureId);
+      }
+      return out;
+    }
+
+    let featuresReady = false;
+    const featuresCard = registerCard('features', {
+      read: () => ({ hidden: readHiddenFromDom() }),
+      write: async (v) => {
+        const r = await api(`${ROUTE}/hidden`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ hidden: v.hidden }),
+        });
+        if (r && r.ok === false) throw new Error(r.error || '服务端没接受这次改动');
+      },
+      apply: (v) => { hidden = Array.isArray(v.hidden) ? v.hidden.slice() : []; renderHidden(); },
+    });
+
     async function refresh() {
       try {
         const st = await api(`${ROUTE}/status`);
-        hidden = Array.isArray(st.hidden) ? st.hidden : [];
+        // 服务端那一份只在「眼里这一份没跟它分歧」时才写回 DOM。有分歧就留着她的改动，
+        // 由卡片头的「恢复上次的值」决定收不收 —— 否则写失败后 4 秒就被悄悄抹掉了。
+        if (featuresReady && cardValue(featuresCard) !== featuresCard.baseline) {
+          /* 分歧中：不动 DOM */
+        } else {
+          featuresCard.apply({ hidden: Array.isArray(st.hidden) ? st.hidden : [] });
+          markClean(featuresCard);
+          featuresReady = true;
+        }
         const map = { ready: '运行中', starting: '启动中', idle: '已停止', error: '出错', disabled: '已停用' };
         document.getElementById('phaseDesc').textContent = map[st.phase] || st.phase;
         const p = st.plugins;
@@ -576,14 +777,16 @@
           plugText,
         ].filter(Boolean).join(' · ');
         document.getElementById('status').textContent = st.lastError ? '最近错误：' + st.lastError : '';
-        if (st.theme) {
-          themeSel.value = st.theme;
-          themeDrop.sync(st.theme);
+        if (st.theme && (!themeReady || cardValue(themeCard) === themeCard.baseline)) {
+          themeCard.apply({ theme: st.theme });
+          markClean(themeCard);
+          themeReady = true;
         }
       } catch (e) {
         document.getElementById('phaseDesc').textContent = '后端不可达';
       }
-      renderHidden();
+      // 还没接过服务端那一份时（比如后端不可达）也得把行画出来，否则这块是空的。
+      if (!featuresReady) renderHidden();
     }
 
     document.getElementById('toggle').addEventListener('click', async () => {
@@ -617,53 +820,74 @@
       if (bad) intervalInput.setAttribute('data-bad', ''); else intervalInput.removeAttribute('data-bad');
     }
 
+    let aboutReady = false;
+    const aboutCard = registerCard('about', {
+      read: () => ({
+        enabled: updateToggle.hasAttribute('data-checked'),
+        intervalMinutes: Number(intervalInput.value.trim()),
+      }),
+      // 本地先拦一道：填得不对就不发，错误摆在那行下面（边界的权威仍在服务端）。
+      validate: () => {
+        const raw = intervalInput.value.trim();
+        if (!/^\d+$/.test(raw) || Number(raw) < 1) { setIntervalHint('要填一个大于 0 的整数分钟数', true); return false; }
+        setIntervalHint('', false);
+        return true;
+      },
+      // 两格一起写（同 token-tracker 的关于卡）：开关与间隔本来就是一张卡上的事。
+      write: async (v) => {
+        await updateApi.dismissUpdate({ action: 'toggle', enabled: v.enabled });
+        await updateApi.setUpdateInterval(v.intervalMinutes);
+        // 写完顺手问一次：间隔可能刚缩短，新版标记也该刷新（间隔没到它不会真出门）。
+        void update?.refresh();
+      },
+      apply: (v) => {
+        if (v.enabled) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
+        updateToggle.setAttribute('aria-checked', v.enabled ? 'true' : 'false');
+        intervalInput.value = String(v.intervalMinutes);
+        setIntervalHint('', false);
+      },
+    });
+
     // 快照一到就刷这一格：版本号、新版标记、开关、间隔。不自己算版本高低，只听服务端的判断。
+    // 开关与间隔只在「眼里这一份没分歧」时才被服务端覆盖（理由同功能卡那头）：
+    // 写失败或填了一半的时候，她眼前那一份必须留着，收不收由「恢复上次的值」说了算。
     function syncAbout(d) {
       verCurrent.textContent = d && d.current ? 'v' + d.current : '—';
       verLatest.textContent = d ? (d.latest ? 'v' + d.latest.version : '—') : '…';
       const has = !!(d && d.hasUpdate);
       verTag.hidden = !has;
       if (has) verTag.textContent = '有新版本 v' + d.latest.version;
-      const on = d ? d.enabled !== false : true;
-      if (on) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
-      updateToggle.setAttribute('aria-checked', on ? 'true' : 'false');
-      // 输入框正在填的时候别去覆盖它，否则打字打到一半会被刷走。
-      if (document.activeElement !== intervalInput) {
-        const minutes = (d && d.intervalMinutes) || 360;
-        if (intervalInput.value !== String(minutes)) intervalInput.value = String(minutes);
-        setIntervalHint('', false);
+      if (d && (!aboutReady || cardValue(aboutCard) === aboutCard.baseline)) {
+        const on = d.enabled !== false;
+        if (on) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
+        updateToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        // 输入框正在填的时候别去覆盖它，否则打字打到一半会被刷走。
+        if (document.activeElement !== intervalInput) {
+          const minutes = d.intervalMinutes || 360;
+          if (intervalInput.value !== String(minutes)) intervalInput.value = String(minutes);
+          setIntervalHint('', false);
+        }
+        aboutReady = true;
+        markClean(aboutCard);
       }
+      syncRestore(aboutCard);
     }
     update?.subscribe(syncAbout);
 
-    updateToggle.addEventListener('click', async () => {
+    updateToggle.addEventListener('click', () => {
       const on = !updateToggle.hasAttribute('data-checked');
       if (on) updateToggle.setAttribute('data-checked', ''); else updateToggle.removeAttribute('data-checked');
       updateToggle.setAttribute('aria-checked', on ? 'true' : 'false');
-      try {
-        syncAbout(await updateApi.dismissUpdate({ action: 'toggle', enabled: on }));
-        void update?.refresh();
-      } catch (e) {
-        setIntervalHint('保存失败：' + ((e && e.message) || e), true);
-      }
+      void commitCard('about');
     });
 
-    // 间隔：打字时不判对错（打到一半不是错），失焦才试一次写入。
-    // 上下界的权威在服务端 —— 它说不行就把它的原话显出来，不在这里猜边界。
+    // 间隔：打字时不判对错（打到一半不是错），只顺手看一眼要不要亮恢复入口；
+    // 失焦（change）才试一次写入。上下界的权威在服务端 —— 它说不行就把它的原话显出来。
     intervalInput.addEventListener('input', () => {
       if (/^\d+$/.test(intervalInput.value.trim())) setIntervalHint('', false);
+      syncRestore(aboutCard);
     });
-    intervalInput.addEventListener('change', async () => {
-      const raw = intervalInput.value.trim();
-      if (!/^\d+$/.test(raw) || Number(raw) < 1) { setIntervalHint('要填一个大于 0 的整数分钟数', true); return; }
-      try {
-        syncAbout(await updateApi.setUpdateInterval(Number(raw)));
-        setIntervalHint('', false);
-        void update?.refresh();
-      } catch (e) {
-        setIntervalHint((e && e.message) || '保存失败', true);
-      }
-    });
+    intervalInput.addEventListener('change', () => { void commitCard('about'); });
 
     document.getElementById('verCheck').addEventListener('click', () => { void update?.openManual(); });
     document.getElementById('verNotes').addEventListener('click', () => { void update?.openCached(); });
