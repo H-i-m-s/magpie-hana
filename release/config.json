@@ -1,11 +1,11 @@
 {
   "schema": 1,
 
-  "publisher": "H-i-M-s",
+  "publisher": "H-i-m-s",
   "defaultBranch": "master",
 
   "release": {
-    "repo": "H-i-M-s/magpie-hana"
+    "repo": "H-i-m-s/magpie-hana"
   },
 
   "pack": {
