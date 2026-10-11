@@ -134,13 +134,59 @@ function loadConfig() {
   if (missing.length) {
     throw die(`release/config.json 有问题：\n      ${missing.join("\n      ")}`, "补齐后再跑一次");
   }
+  // pack 的排除表也要读：预检要用它判断「这个改动会不会进包」。
+  // 不在这里报 pack.mjs 那些类型错误 —— 出包那一步会拦住的，这里只需要一组能用的集合。
+  const pack = raw.pack && typeof raw.pack === "object" ? raw.pack : {};
+  const strList = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === "string" && x) : []);
+
   return {
     publisher: raw.publisher.trim(),
     defaultBranch: typeof raw.defaultBranch === "string" && raw.defaultBranch ? raw.defaultBranch : "master",
     releaseRepo: raw.release.repo.trim(),
     releaseTitle: typeof raw.release.title === "string" && raw.release.title ? raw.release.title : null,
-    packOut: raw.pack && typeof raw.pack.out === "string" && raw.pack.out ? raw.pack.out : "dist",
+    packOut: pack.out && typeof pack.out === "string" ? pack.out : "dist",
+    packExclude: {
+      dirs: new Set(strList(pack.excludeDirs)),
+      names: new Set(strList(pack.excludeNames)),
+      prefixes: strList(pack.excludePrefixes),
+      suffixes: strList(pack.excludeSuffixes),
+      extensions: new Set(strList(pack.excludeExtensions).map((e) => e.replace(/^\./, "").toLowerCase())),
+    },
   };
+}
+
+/**
+ * 这条仓库内的路径会不会进包？判定与 pack.mjs 的 collect() 一致：
+ *   - 任何一段目录名命中 pack.excludeDirs 就不进包（pack.mjs 从仓库根往下，每一层目录都查这张表）
+ *   - 文件名再过 excludeNames / excludePrefixes / excludeSuffixes / excludeExtensions 四张表
+ *   - 输出目录（pack.out）永远不进包
+ *
+ * 语义必须跟 pack.mjs 对齐：这里判错，预检就会拦一个其实不会进包的改动，或者放过一个会进包的。
+ */
+function isPackagedPath(config, relPath) {
+  const p = String(relPath || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "");
+  if (!p) return false;
+  const parts = p.split("/").filter(Boolean);
+  if (!parts.length) return false;
+
+  const ex = config.packExclude;
+  if (parts.some((seg) => ex.dirs.has(seg))) return false;
+
+  const outDir = String(config.packOut || "dist")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  if (outDir && (p === outDir || p.startsWith(`${outDir}/`))) return false;
+
+  const name = parts[parts.length - 1];
+  if (ex.names.has(name)) return false;
+  if (ex.prefixes.some((pre) => name.startsWith(pre))) return false;
+  if (ex.suffixes.some((suf) => name.endsWith(suf))) return false;
+  const dot = name.lastIndexOf(".");
+  if (dot > 0 && ex.extensions.has(name.slice(dot + 1).toLowerCase())) return false;
+  return true;
 }
 
 function readManifestText() {
@@ -296,17 +342,41 @@ function preflight(config, ctx, args) {
     throw die(`当前分支是 ${branch}，config 里写的是 ${config.defaultBranch}`, `先切到 ${config.defaultBranch} 再发版`);
   }
 
-  if (args.mode !== "pack" && !args.dryRun) {
-    // 唯一允许的不干净：manifest.json —— 脚本自己会改它，并且会替你把这一次提交做掉。
-    const lines = gitQuiet(["status", "--porcelain"])
+  if (args.mode !== "pack") {
+    // 干净检查只认「会进包的文件」。
+    //
+    // 这条检查要保证的是「包里的东西都提交过了」，所以不进包的文件（release/、doc/、dist/、
+    // 出包排除表里的一切）改没改都不应该影响发版 —— 拿整个工作区当判据会误拦。
+    // 排除表直接读 config.json 的 pack 段，跟 pack.mjs 用同一套规则（见 isPackagedPath）。
+    //
+    // 额外豁免 manifest.json：脚本自己会改它，并且会替你把这一次提交做掉。
+    //
+    // 干跑也照样查、照样拦。干跑的意义是「真跑会发生什么」的预演，跳过一道会拦人的闸，
+    // 预演就成了假话。要中途随便改代码还能跑通，用 --mode=pack（它本来就不看工作区）。
+    const lines = gitQuiet(["-c", "core.quotepath=false", "status", "--porcelain"])
       .stdout.split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .filter((l) => !/(^|\s)manifest\.json$/.test(l));
-    if (lines.length) {
+      .map((l) => l.trimEnd())
+      .filter(Boolean);
+    const dirty = [];
+    for (const line of lines) {
+      const flag = line.slice(0, 2).trim() || "??";
+      const rest = line.slice(3);
+      // 重命名写成 "旧 -> 新"，两边都要判：新路径会在包里，旧路径可能还在
+      const paths = rest.includes(" -> ") ? rest.split(" -> ") : [rest];
+      for (const p of paths) {
+        const rel = p.trim().replace(/^"|"$/g, "");
+        if (rel === "manifest.json") continue;
+        if (!isPackagedPath(config, rel)) continue;
+        dirty.push(`${flag}  ${rel}`);
+        break;
+      }
+    }
+    if (dirty.length) {
       throw die(
-        `工作区有未提交的改动，发版前请先处理：\n      ${lines.slice(0, 10).join("\n      ")}`,
-        "先把要发的代码提交推送，再发版；脚本只会替你把版本号那一次提交做掉",
+        `会进包的文件有未提交的改动，发版前请先处理：\n      ${dirty.slice(0, 10).join("\n      ")}`,
+        args.dryRun
+          ? "先把这些改动提交或撤销；干跑也照实拦，因为真跑到这一步同样会停"
+          : "先把要发的代码提交推送，再发版；脚本只会替你把版本号那一次提交做掉",
       );
     }
   }
@@ -592,11 +662,26 @@ function releaseStage(config, ctx, args) {
       );
     }
     const localEntryBytes = statSync(ctx.entryPath).size;
-    if (remoteEntry.size !== localEntryBytes) {
+    const localEntrySha = createHash("sha256").update(readFileSync(ctx.entryPath)).digest("hex");
+    // 条目要比内容，不能只比字节数。digest 是 GitHub 存着的 "sha256:<hex>"。
+    // 只比字节数的话，同长度的改动会被当成同一份：比如 publisher 从 H-i-M-s 写成 H-i-m-s，
+    // 一个字符的大小写，字节数分毫不差 —— 于是这里判「一致」、跳过重传，远端那个错的条目
+    // 就永远留在 Release 上，而市场恰好是拿它来校验身份的。
+    const remoteEntrySha = String(remoteEntry.digest || "").replace(/^sha256:/, "");
+    if (remoteEntrySha) {
+      if (remoteEntrySha !== localEntrySha) {
+        throw die(
+          `远端 Release ${ctx.tag} 上的条目和本地刚出的不是同一份\n      远端 ${remoteEntrySha}\n      本地 ${localEntrySha}`,
+          "删掉远端那个 Release 重发，或者换一个版本号",
+        );
+      }
+    } else if (remoteEntry.size !== localEntryBytes) {
       throw die(
         `远端 Release ${ctx.tag} 上的条目和本地刚出的不是同一份（远端 ${remoteEntry.size} 字节，本地 ${localEntryBytes} 字节）`,
         "删掉远端那个 Release 重发，或者换一个版本号",
       );
+    } else {
+      warn(`远端条目没有 digest，只比了字节数（${localEntryBytes}）：同长度但内容不同的条目会比不出来，必要时人工核对`);
     }
 
     info(`Release ${ctx.tag} 已存在，附件与本地一致，跳过`);

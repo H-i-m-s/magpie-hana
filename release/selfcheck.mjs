@@ -42,8 +42,15 @@ const rel = (p) => relative(ROOT, p).split(sep).join("/");
 const fail = (m) => errors.push(m);
 const warn = (m) => warnings.push(m);
 
-/** 宿主对卡片形态的取值。写成别的，宿主会「当它没声明」并退回默认，不报错。 */
-const CARD_FORMS = new Set(["framed", "flush"]);
+/**
+ * 宿主对卡片形态的取值。写成别的，宿主会「当它没声明」并退回默认，不报错。
+ *
+ * 这张表对照 Hana 1.0.11 服务端的实现：v2 的白名单是 framed / structural / edge-to-edge
+ * （0.1017.0 起支持后两个），旧的 flush / fill / unified 仍被接受、内部映射成 flush。
+ * 原来这里只有 framed / flush —— 抄的是更早版本的白名单，于是 edge-to-edge 被误报成
+ * 「宿主不认」。误报的代价不是拦发布，是让人开始不信这个终端。
+ */
+const CARD_FORMS = new Set(["framed", "structural", "edge-to-edge", "flush", "fill", "unified"]);
 
 // ── 1) manifest.json 与它指向的文件 ─────────────────────────────────────────
 let manifest = null;
@@ -72,7 +79,7 @@ if (manifest) {
   for (const card of cards) {
     const form = card?.cardForm;
     if (form !== undefined && !CARD_FORMS.has(form)) {
-      warn(`contributes.cards[${card.id ?? "?"}].cardForm 是 ${JSON.stringify(form)}，宿主只认 framed / flush，会当成没声明（现按默认渲染）`);
+      warn(`contributes.cards[${card.id ?? "?"}].cardForm 是 ${JSON.stringify(form)}，宿主不认（认的是 framed / structural / edge-to-edge，旧的 flush / fill / unified 也接受），会当成没声明（现按默认渲染）`);
     }
   }
 }

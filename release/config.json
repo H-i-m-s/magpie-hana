@@ -20,7 +20,7 @@
       "scripts",
       "tools"
     ],
-    "excludeNames": [".DS_Store", "Thumbs.db", "desktop.ini"],
+    "excludeNames": [".DS_Store", "Thumbs.db", "desktop.ini", ".gitignore"],
     "excludePrefixes": ["._"],
     "excludeExtensions": ["tmp", "temp", "swp", "swo", "log", "bak"],
     "excludeSuffixes": ["~"],
