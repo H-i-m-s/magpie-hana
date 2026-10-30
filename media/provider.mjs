@@ -31,8 +31,7 @@
 //   整棵树连着外网），让那个进程跑完网关与下载、把文件落到成品目录、只回文件名，
 //   这里就只跟 127.0.0.1 说话。
 
-import { readFileSync } from "node:fs";
-import { extname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export const GATEWAY_BASE = "http://127.0.0.1:3425";
 export const PROVIDER_ID = "magpie-hana";
@@ -50,22 +49,18 @@ const pick = (...vals) => {
   return "";
 };
 
-const MIME_OF_EXT = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".gif": "image/gif",
-  ".avif": "image/avif",
-};
-
 function sweepJobs() {
   const now = Date.now();
   for (const [k, v] of jobs) if (now - (v.createdAt || 0) > JOB_TTL_MS) jobs.delete(k);
 }
 
-/** 参考图：caller 给的是会话里的文件引用，先落成本地路径，再读成 data URL。
- *  magpie 的网关只认 URL 或 data URL（它自己去 fetch），不认本地路径。 */
+/** 参考图：caller 给的是会话里的文件引用，宿主已经解析成本地绝对路径。
+ *  这里只把它归成「本地路径」或「现成 URL」，**不读盘**：
+ *  App 进程是带 --permission 起的，--allow-fs-read 只放了 apps/<id>、
+ *  app-data/<id>、locales 三个目录；会话附件在 …\.hanako\uploads 下，
+ *  readFileSync 必被拒（ERR_ACCESS_DENIED），整次 submit 会在读完之前就失败。
+ *  真正的读取与 base64 化在代理进程里做（runtime/proxy.mjs 的 runDraw），
+ *  那个进程没有这层文件限制。 */
 function referenceEntries(params) {
   const raw = [
     ...(Array.isArray(params.referenceImages) ? params.referenceImages : []),
@@ -83,19 +78,17 @@ function pathOfReference(item) {
   return "";
 }
 
-function dataUrlFor(item) {
+function referenceOf(item) {
   const asPath = pathOfReference(item);
-  if (!asPath) {
-    // 可能是 http(s)/data URL 直接放在对象里
-    const url = item && typeof item === "object" ? String(item.url || "") : "";
-    if (/^(https?:|data:)/i.test(url)) return url;
-    throw new Error(`认不出这张参考图：${JSON.stringify(item).slice(0, 160)}`);
+  if (asPath) {
+    if (/^(https?:|data:)/i.test(asPath)) return { url: asPath };
+    if (!isAbsolute(asPath)) throw new Error(`参考图不是绝对路径：${asPath}`);
+    return { path: asPath };
   }
-  if (/^(https?:|data:)/i.test(asPath)) return asPath;
-  if (!isAbsolute(asPath)) throw new Error(`参考图不是绝对路径：${asPath}`);
-  const buf = readFileSync(asPath);
-  const mime = MIME_OF_EXT[extname(asPath).toLowerCase()] || "image/png";
-  return `data:${mime};base64,${buf.toString("base64")}`;
+  // 可能是 http(s)/data URL 直接放在对象里
+  const url = item && typeof item === "object" ? String(item.url || "") : "";
+  if (/^(https?:|data:)/i.test(url)) return { url };
+  throw new Error(`认不出这张参考图：${JSON.stringify(item).slice(0, 160)}`);
 }
 
 export function createMagpieImageProvider({ fetchImpl, proxyBase, log = () => {}, warn = () => {} }) {
@@ -240,18 +233,18 @@ export function createMagpieImageProvider({ fetchImpl, proxyBase, log = () => {}
 
       const refs = referenceEntries(params);
       if (refs.length > MAX_REFS) throw new Error(`参考图最多 ${MAX_REFS} 张，给了 ${refs.length} 张`);
-      const images = refs.map(dataUrlFor);
+      const references = refs.map(referenceOf);
 
       const body = { model, prompt, n };
       if (size) body.size = size;
       if (quality) body.quality = quality;
       if (background) body.background = background;
       if (format) body.output_format = format;
-      if (images.length) body.images = images;
+      if (references.length) body.references = references;
 
       const taskId = `magpie-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       jobs.set(taskId, { status: "pending", createdAt: Date.now() });
-      log(`生图提交：${model}（n=${n}${size ? `, size=${size}` : ""}${images.length ? `, 参考图 ${images.length}` : ""}）`);
+      log(`生图提交：${model}（n=${n}${size ? `, size=${size}` : ""}${references.length ? `, 参考图 ${references.length}` : ""}）`);
       void runJob(taskId, body, ctx);
       return { taskId };
     },

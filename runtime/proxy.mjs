@@ -2321,6 +2321,22 @@ function sendJson(res, obj, status = 200) {
 const GATEWAY_BASE = "http://127.0.0.1:3425";
 const DRAW_TIMEOUT_MS = 5 * 60 * 1000 + 30 * 1000;   // magpie 那边上限 5 分钟
 const DRAW_MAX_BYTES = 64 * 1024 * 1024;
+const DRAW_MAX_REF_BYTES = 20 * 1024 * 1024;           // 单张参考图上限
+
+const MIME_OF_IMAGE_EXT = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".avif": "image/avif",
+};
+
+function imageMimeOf(p) {
+  const s = String(p || "").toLowerCase();
+  const i = s.lastIndexOf(".");
+  return (i >= 0 && MIME_OF_IMAGE_EXT[s.slice(i)]) || "image/png";
+}
 
 function extOfMimeType(mime, fallback) {
   const m = String(mime || "").toLowerCase();
@@ -2356,12 +2372,46 @@ async function runDraw(b) {
   const outDir = String(b.outDir || "").trim() || join(process.cwd(), "generated");
   const tmpDir = String(b.tmpDir || "").trim() || join(process.cwd(), "tmp", "draw-" + Date.now().toString(36));
 
+  // 参考图读取放在本进程，而不是适配器里。
+  // 为什么：适配器跑在 App 主进程，那个进程带 --permission 起，
+  // --allow-fs-read 只放了 apps/<id>、app-data/<id>、locales 三个目录；
+  // 会话附件在 …\.hanako\uploads 下，readFileSync 必被拒（ERR_ACCESS_DENIED），
+  // 整次提交在读到文件前就失败——对外表现就是「这个供应商不支持图生图」。
+  // 本进程没有那层限制，由它读 → data URL（网关只认 URL 或 data URL）。
+  const images = [];
+  const refs = Array.isArray(b.references) ? b.references : [];
+  for (let i = 0; i < refs.length; i += 1) {
+    const r = refs[i];
+    const url = r && typeof r === "object" ? String(r.url || "") : "";
+    if (/^(https?:|data:)/i.test(url)) { images.push(url); continue; }
+    const p = r && typeof r === "object" ? String(r.path || "") : "";
+    if (!p) return { ok: false, error: `第 ${i + 1} 张参考图既没有 path 也没有 url` };
+    let buf;
+    try {
+      buf = readFileSync(p);
+    } catch (e) {
+      const code = (e && e.code) || (e && e.message) || e;
+      return { ok: false, error: `读不到参考图（${code}）：${p}` };
+    }
+    if (!buf.length) return { ok: false, error: `参考图是空文件：${p}` };
+    if (buf.length > DRAW_MAX_REF_BYTES) {
+      return { ok: false, error: `参考图太大（${Math.round(buf.length / 1048576)}MB）：${p}` };
+    }
+    images.push(`data:${imageMimeOf(p)};base64,${buf.toString("base64")}`);
+  }
+  // 兼容老适配器：它以前会直接送来已经 base64 好的 data URL。
+  if (Array.isArray(b.images)) {
+    for (const v of b.images) if (typeof v === "string" && v) images.push(v);
+  }
+
   // 只传 magpie 真认的字段（它读 JSON 时只挑这几个键）。
   const body = { model, prompt };
-  for (const k of ["n", "size", "quality", "background", "output_format", "images"]) {
+  for (const k of ["n", "size", "quality", "background", "output_format"]) {
     const v = b[k];
     if (v !== undefined && v !== null && v !== "") body[k] = v;
   }
+  if (images.length) body.images = images;
+  if (images.length) log(`生图带参考图 ${images.length} 张（本进程读盘 → data URL）`);
 
   const t0 = Date.now();
   let res;
